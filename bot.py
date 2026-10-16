@@ -330,20 +330,21 @@ def _vlm_env(name: str, default: str) -> str:
 
 
 _VLM_PROVIDERS = [
-    # 1) Google AI Studio (ключ GEMINI_API_KEY). Регион РФ блокируется — работает на
+    # 1) Groq (ключ GROQ_API_KEY) — БАЗА: бесплатный тир, очень быстрый, без
+    #    региональных блоков (работает и из РФ, и с Render). Vision: qwen3.8-27b.
+    (
+        "groq",
+        _vlm_env("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+        "GROQ_API_KEY",
+        _vlm_env("GROQ_MODELS", "qwen/qwen3.8-27b"),
+    ),
+    # 2) Google AI Studio (ключ GEMINI_API_KEY). Регион РФ блокируется — работает на
     #    Render (Frankfurt). Недоступный регион авто-выключаем (см. _VLM_DISABLED).
     (
         "gemini",
         _vlm_env("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
         "GEMINI_API_KEY",
         _vlm_env("GEMINI_MODELS", "gemini-3.8-flash,gemini-flash-latest"),
-    ),
-    # 2) Groq (ключ GROQ_API_KEY) — быстрый, бесплатный тир, vision Llama 4 Scout.
-    (
-        "groq",
-        _vlm_env("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
-        "GROQ_API_KEY",
-        _vlm_env("GROQ_MODELS", "qwen/qwen3.8-27b"),
     ),
     # 3) AIHubMix (ключ AIHUBMIX_API_KEY) — агрегатор, OpenAI-совместимый, vision.
     (
