@@ -1,0 +1,30 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Деплой лайт-режима (БЕЗ MediaPipe/OpenCV): native Python + requirements-render.txt.
+# Мини-апп и /api/* поднимаются в webhook-режиме, т.к. Render задаёт RENDER_EXTERNAL_URL.
+services:
+  - type: web
+    name: lookernice-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    branch: main
+    autoDeploy: true
+    buildCommand: pip install --upgrade pip && pip install -r requirements-render.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.1"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: MODEL_BASE_URL
+        value: https://open.bigmodel.cn/api/paas/v4
+      - key: MODEL_NAME
+        value: glm-4.6v-flash
+      # секреты — заполняются в дашборде Render (не в репо)
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: MODEL_API_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true

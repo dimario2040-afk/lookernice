@@ -1,0 +1,9 @@
+# В Docker-образ (и на хостинг) едут только файлы бота.
+# НЕ тащи сюда .3mf/.glb/.zip и прочий мусор из папки.
+*
+!bot.py
+!requirements.txt
+!game
+!game/*
+!webapp
+!webapp/*

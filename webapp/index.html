@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>MOG — могни всех</title>
+  <link rel="stylesheet" href="/app/style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- HOME -->
+    <section id="screen-home" class="screen active">
+      <div class="logo">MOG<span>·</span>EM ALL</div>
+      <p class="tagline">18+. Гача по лицу. Кидай фото — собирай мог-карты.</p>
+
+      <div class="chips">
+        <div class="chip"><b id="chip-rolls">3</b><span>роллов</span></div>
+        <div class="chip"><b id="chip-crits">0</b><span>критов</span></div>
+        <div class="chip"><b id="chip-best">—</b><span>лучший</span></div>
+      </div>
+
+      <button id="btn-roll" class="btn primary big">📸 Кинуть фото</button>
+      <div class="row">
+        <button id="btn-board" class="btn ghost">🏆 Лидерборд</button>
+        <button id="btn-check" class="btn ghost">🔍 Проверить друга</button>
+      </div>
+      <div class="row">
+        <button id="btn-shop" class="btn ghost">⭐ Магазин (Stars)</button>
+      </div>
+
+      <p class="tiny">MOG — развлекательная игра. Балл генерируется случайно,
+        не является научной, медицинской или объективной оценкой внешности.</p>
+    </section>
+
+    <!-- LOADING -->
+    <section id="screen-loading" class="screen">
+      <div class="spinner"></div>
+      <p id="loading-text">Могнём…</p>
+    </section>
+
+    <!-- CARD -->
+    <section id="screen-card" class="screen">
+      <div id="card" class="card t-Common">
+        <div class="card-top">
+          <span id="card-tier" class="tier-badge">Common</span>
+          <span id="card-crit" class="crit-badge hidden">💎 КРИТ</span>
+        </div>
+        <div class="card-face">🫥</div>
+        <div id="card-score" class="score">0.00</div>
+        <div class="score-sub">МОГ-балл</div>
+        <div id="stat-bars" class="stats"></div>
+        <p id="card-roast" class="roast"></p>
+        <p class="tiny card-disclaimer">MOG — игра. Балл случаен, не оценка внешности.</p>
+      </div>
+
+      <div class="row">
+        <button id="btn-again" class="btn primary">🔁 Крутить ещё <span id="again-left" class="pill">3</span></button>
+      </div>
+      <div class="row">
+        <button id="btn-crit" class="btn ghost hidden">⭐ Крит-токен</button>
+      </div>
+      <div class="row">
+        <button id="btn-share" class="btn ghost">📤 Шарить</button>
+        <button id="btn-home" class="btn ghost">🏠 Меню</button>
+      </div>
+    </section>
+
+    <!-- BATTLE -->
+    <section id="screen-battle" class="screen">
+      <h2>⚔️ Мог-батл</h2>
+      <div id="battle-info" class="battle-info"></div>
+      <button id="btn-battle-photo" class="btn primary big">📸 Кинуть фото и воевать</button>
+    </section>
+
+    <!-- LEADERBOARD -->
+    <section id="screen-board" class="screen">
+      <h2>🏆 Топ МОГ</h2>
+      <ol id="board-list" class="board"></ol>
+      <button id="btn-home2" class="btn ghost">🏠 Меню</button>
+    </section>
+
+    <!-- SHOP -->
+    <section id="screen-shop" class="screen">
+      <h2>⭐ Магазин</h2>
+      <p class="tagline">Оплата в Telegram Stars. Роллы не сгорают — лежат до конца.</p>
+      <div id="shop-list" class="board"></div>
+      <button id="btn-home3" class="btn ghost">🏠 Меню</button>
+    </section>
+
+    <input id="file-input" type="file" accept="image/*" capture="user" hidden />
+    <div id="toast" class="toast hidden"></div>
+    <canvas id="share-canvas" hidden></canvas>
+  </div>
+  <script src="/app/app.js"></script>
+</body>
+</html>

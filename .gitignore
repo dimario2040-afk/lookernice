@@ -1,0 +1,19 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+face_landmarker.task
+mog.db
+*.db-journal
+
+# логи (могут содержать токен/ключи)
+*.log
+bot.err.log
+bot.out.log
+
+# тулчайн/локальные артефакты
+.omo/
+.codegraph/
+.venv/
+venv/
