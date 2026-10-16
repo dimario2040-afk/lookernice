@@ -51,18 +51,52 @@ async def accept(battle_id: int, user: dict) -> tuple[bool, str]:
 
 
 async def resolve(battle_id: int, opponent_score: float) -> dict:
-    """Фиксирует ролл оппонента и определяет победителя (draw при равенстве)."""
+    """Фиксирует ролл оппонента и определяет победителя (draw при равенстве).
+
+    Учитывает купленные артефакты (модель B: capped-буст + контры «Анти-сглаз»).
+    """
+    from . import artifacts as mog_art
+
     await db.set_opponent_roll(battle_id, opponent_score)
     battle = await db.get_battle(battle_id)
     assert battle is not None
 
-    cs = battle["challenger_score"] or 0.0
-    os_ = opponent_score or 0.0
+    cid = battle["challenger_id"]
+    oid = battle["opponent_id"]
+
+    # Соперник мог не принять вызов (opponent_id=0) — тогда бой без второй стороны.
+    if not oid:
+        cid_score = float(battle["challenger_score"] or 0.0)
+        await db.finish_battle(battle_id, cid)
+        return {
+            "battle_id": battle_id,
+            "chat_id": battle["chat_id"],
+            "challenger_id": cid,
+            "challenger_name": battle["challenger_name"],
+            "challenger_score": cid_score,
+            "opponent_id": 0,
+            "opponent_name": "",
+            "opponent_score": float(opponent_score or 0.0),
+            "winner_id": cid,
+            "challenger_comp": {},
+            "opponent_comp": {},
+        }
+
+    c_items = await db.battle_artifacts(battle_id, cid)
+    o_items = await db.battle_artifacts(battle_id, oid)
+    comp = mog_art.compute(
+        [
+            {"id": cid, "score": battle["challenger_score"] or 0.0, "items": c_items},
+            {"id": oid, "score": opponent_score or 0.0, "items": o_items},
+        ]
+    )
+    cs = comp[cid]["eff"]
+    os_ = comp[oid]["eff"]
 
     if cs > os_:
-        winner_id = battle["challenger_id"]
+        winner_id = cid
     elif os_ > cs:
-        winner_id = battle["opponent_id"]
+        winner_id = oid
     else:
         winner_id = None  # ничья
 
@@ -70,13 +104,15 @@ async def resolve(battle_id: int, opponent_score: float) -> dict:
     return {
         "battle_id": battle_id,
         "chat_id": battle["chat_id"],
-        "challenger_id": battle["challenger_id"],
+        "challenger_id": cid,
         "challenger_name": battle["challenger_name"],
         "challenger_score": cs,
-        "opponent_id": battle["opponent_id"],
+        "opponent_id": oid,
         "opponent_name": battle["opponent_name"],
         "opponent_score": os_,
         "winner_id": winner_id,
+        "challenger_comp": comp[cid],
+        "opponent_comp": comp[oid],
     }
 
 
@@ -99,9 +135,24 @@ def result_text(r: dict) -> str:
     else:
         verdict = f"👑 <b>ПОБЕДА: {o}</b>"
 
+    boost_block = ""
+    c_comp = r.get("challenger_comp") or {}
+    o_comp = r.get("opponent_comp") or {}
+    if c_comp or o_comp:
+        from . import artifacts as mog_art
+
+        blines = [
+            mog_art.result_line(r["challenger_name"], c_comp),
+            mog_art.result_line(r["opponent_name"], o_comp),
+        ]
+        blines = [b for b in blines if b]
+        if blines:
+            boost_block = "\n".join(blines) + "\n\n"
+
     return (
         f"🏒 <b>МОГ-БАТТЛ #{r['battle_id']}</b>\n{board}\n"
         f"{c} — вызывающий · {o} — принимающий\n\n"
+        f"{boost_block}"
         f"{verdict}\n\n"
         "<i>MOG — игра. Баллы случайны, не оценка внешности.</i>"
     )

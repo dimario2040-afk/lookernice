@@ -75,6 +75,22 @@ CREATE TABLE IF NOT EXISTS arena_players (
     joined_at TEXT    NOT NULL DEFAULT '',
     UNIQUE(arena_id, user_id)
 );
+
+CREATE TABLE IF NOT EXISTS battle_artifacts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    battle_id  INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    item       TEXT    NOT NULL,
+    paid       INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bart_battle ON battle_artifacts(battle_id);
+
+CREATE TABLE IF NOT EXISTS artifact_free (
+    user_id INTEGER NOT NULL,
+    day     TEXT    NOT NULL,
+    UNIQUE(user_id, day)
+);
 """
 
 
@@ -454,3 +470,43 @@ async def arena_count(arena_id: int) -> int:
     )
     row = await cur.fetchone()
     return int(row["n"]) if row else 0
+
+
+# ---------------------------------------------------------------- артефакты (баттлы)
+
+
+async def add_battle_artifact(
+    battle_id: int, user_id: int, item: str, paid: bool = False
+) -> int:
+    """Прикрепляет артефакт к баттлу за конкретного игрока (моментально)."""
+    assert _db is not None
+    cur = await _db.execute(
+        "INSERT INTO battle_artifacts (battle_id, user_id, item, paid, created_at)"
+        " VALUES (?,?,?,?,?)",
+        (battle_id, user_id, item, int(bool(paid)), _now()),
+    )
+    await _db.commit()
+    return int(cur.lastrowid)
+
+
+async def battle_artifacts(battle_id: int, user_id: int) -> list[str]:
+    """Список ключей артефактов игрока в баттле (в порядке покупки)."""
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT item FROM battle_artifacts WHERE battle_id=? AND user_id=? ORDER BY id",
+        (battle_id, user_id),
+    )
+    return [r["item"] for r in await cur.fetchall()]
+
+
+async def claim_free_artifact(user_id: int) -> bool:
+    """True — если бесплатный артефакт сегодня ещё не брали (и теперь заняли)."""
+    assert _db is not None
+    try:
+        await _db.execute(
+            "INSERT INTO artifact_free (user_id, day) VALUES (?,?)", (user_id, _today())
+        )
+        await _db.commit()
+        return True
+    except Exception:  # noqa: BLE001 — UNIQUE(user_id, day): уже брали сегодня
+        return False

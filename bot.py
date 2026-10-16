@@ -10,6 +10,7 @@ import io
 import logging
 import math
 import os
+import random
 import tempfile
 
 # Тяжёлая биометрия — ОПЦИОНАЛЬНА: на free-хостинге (Render, 512MB RAM)
@@ -732,7 +733,8 @@ async def cmd_help(msg: Message) -> None:
         "Просто отправь фото в чат 👇\n\n"
         "⚔️ Бател: ответь на сообщение и напиши /mog — или /mog без ответа "
         "(открытый вызов, кто примет кнопкой).\n"
-        "🏆 Арена до 8: /arena в группе.",
+        "🏆 Арена до 8: /arena в группе.\n"
+        "🎒 Артефакты в бою: за Stars, буст до +0.5 (есть 🎁 бесплатный раз в день).",
     )
 
 
@@ -805,7 +807,12 @@ def _duel_keyboard(battle_id: int, *, open_challenge: bool):
             InlineKeyboardButton(
                 text="⚔️ Принять вызов", callback_data=f"duel_accept:{battle_id}"
             )
-        ]
+        ],
+        [
+            InlineKeyboardButton(
+                text="🎒 Артефакты", callback_data=f"art_shop:{battle_id}"
+            )
+        ],
     ]
     if not open_challenge and PUBLIC_BASE_URL:
         rows.append(
@@ -907,6 +914,97 @@ async def on_arena_quick(cb: CallbackQuery) -> None:
         reply_markup=mog_arena.lobby_keyboard(arena, plist),
         parse_mode="HTML",
     )
+
+
+# ───────────────────────── АРТЕФАКТЫ (магазин боя) ─────────────────────────
+async def _art_battle_guard(cb: CallbackQuery, battle_id: int):
+    """Общая проверка: бой открыт и cb-юзер — его участник. Вернёт battle или None."""
+    from game import db as mog_db
+
+    battle = await mog_db.get_battle(battle_id)
+    if not battle or battle["status"] != "pending":
+        await cb.answer("Бой уже закрыт — артефакты ни к чему 😈", show_alert=True)
+        return None
+    if cb.from_user.id not in (battle["challenger_id"], battle["opponent_id"]):
+        await cb.answer("Это не твой бой 👀", show_alert=True)
+        return None
+    return battle
+
+
+async def _art_shop_view(cb: CallbackQuery, battle_id: int, mine: list[str], theirs: list[str]) -> None:
+    from game import artifacts as mog_art
+
+    await cb.message.answer(
+        mog_art.shop_text(battle_id, mine, theirs),
+        reply_markup=mog_art.shop_keyboard(battle_id, mine),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("art_shop:"))
+async def on_art_shop(cb: CallbackQuery) -> None:
+    """🎒 Магазин артефактов текущего боя."""
+    from game import db as mog_db
+
+    battle_id = int(cb.data.split(":", 1)[1])
+    battle = await _art_battle_guard(cb, battle_id)
+    if battle is None:
+        return
+    uid = cb.from_user.id
+    mine = await mog_db.battle_artifacts(battle_id, uid)
+    opp_id = battle["opponent_id"] if uid == battle["challenger_id"] else battle["challenger_id"]
+    theirs = await mog_db.battle_artifacts(battle_id, opp_id) if opp_id else []
+    await cb.answer()
+    await _art_shop_view(cb, battle_id, mine, theirs)
+
+
+@dp.callback_query(F.data.startswith("art_buy:"))
+async def on_art_buy(cb: CallbackQuery, bot: Bot) -> None:
+    """Покупка артефакта за Stars (счёт в чат)."""
+    from game import artifacts as mog_art
+    from game import payments
+
+    _, bid_s, item = (cb.data or "").split(":", 2)
+    if item not in mog_art.ARTIFACTS:
+        await cb.answer("Такого артефакта нет.", show_alert=True)
+        return
+    battle_id = int(bid_s)
+    if await _art_battle_guard(cb, battle_id) is None:
+        return
+    try:
+        await payments.send_artifact_invoice(bot, cb.message.chat.id, cb.from_user.id, battle_id, item)
+        await cb.answer("Счёт отправлен ⭐")
+    except Exception:  # noqa: BLE001
+        log.exception("artifact invoice failed")
+        await cb.answer(PUBLIC_ERROR, show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("art_free:"))
+async def on_art_free(cb: CallbackQuery) -> None:
+    """🎁 Бесплатный артефакт раз в день (ролл на удачу, без «Анти-сглаза»)."""
+    from game import artifacts as mog_art
+    from game import db as mog_db
+
+    battle_id = int(cb.data.split(":", 1)[1])
+    battle = await _art_battle_guard(cb, battle_id)
+    if battle is None:
+        return
+    if not await mog_db.claim_free_artifact(cb.from_user.id):
+        await cb.answer("Бесплатный уже брал сегодня — завтра 😉", show_alert=True)
+        return
+    item = random.choice(("lift", "light", "osteo"))
+    await mog_db.add_battle_artifact(battle_id, cb.from_user.id, item, paid=False)
+    a = mog_art.ARTIFACTS[item]
+    await cb.answer("Подарок! 🎁")
+    uid = cb.from_user.id
+    mine = await mog_db.battle_artifacts(battle_id, uid)
+    opp_id = battle["opponent_id"] if uid == battle["challenger_id"] else battle["challenger_id"]
+    theirs = await mog_db.battle_artifacts(battle_id, opp_id) if opp_id else []
+    await cb.message.answer(
+        f"🎁 <b>Бесплатный артефакт:</b> {a['emoji']} {a['name']} — {a['desc']}",
+        parse_mode="HTML",
+    )
+    await _art_shop_view(cb, battle_id, mine, theirs)
 
 
 # ───────────────────────── РЕВАНШ ─────────────────────────
