@@ -660,14 +660,36 @@ async def on_paid(msg: Message) -> None:
         )
 
 
+# Добивки после оценки: ровно два предложения, потом дисклеймер.
+# Только самоирония игры: без оскорблений по защищённым признакам и без темы самоповреждения.
+_MOG_PUNCHLINES = (
+    "Счёт зафиксирован нотариусом выдуманных наук. Апелляции принимаются только звёздами.",
+    "Эксперты разошлись во мнениях, но сошлись в баре. Твой балл уже обсуждают без тебя.",
+    "Замеры проведены линейкой, купленной на сдачу. Погрешность спишем на харизму.",
+    "Результат заверен печатью «примерно». Пересдача — завтра, с другого ракурса.",
+    "Алгоритм трижды перепроверил и один раз присвистнул. Дальше — только легенда.",
+    "Протокол подписан, свидетели подкуплены комплиментами. Балл обжалованию не подлежит.",
+    "Коллегия псевдоучёных голосовала дважды: второй раз — чтобы поржать. Вердикт устоял.",
+    "Лаборатория подтверждает: лицо настоящее, цифры выдуманные. Наука бессильна.",
+)
+
+
 def _mog_tag(photo_bytes: bytes) -> str:
-    """МОГ-балл + дисклеймер для любой выдачи анализа внешности (спек §7)."""
+    """МОГ-балл + две смешные добивки + дисклеймер для любой выдачи (спек §7)."""
+    import hashlib
+
     from game import config as mog_config
     from game import rolls as mog_rolls
 
     score = round(mog_rolls.base_score(photo_bytes), 4)
     tier = mog_rolls.tier_for(score)
-    return f"\n\n🎲 <b>МОГ: {score:.4f} · {tier}</b>\n<i>{mog_config.DISCLAIMER}</i>"
+    punch = _MOG_PUNCHLINES[
+        int(hashlib.sha256(photo_bytes).hexdigest(), 16) % len(_MOG_PUNCHLINES)
+    ]
+    return (
+        f"\n\n🎲 <b>МОГ: {score:.4f} · {tier}</b>\n{punch}\n"
+        f"<i>{mog_config.DISCLAIMER}</i>"
+    )
 
 
 # ───────────────────────── НЕОН-СКАН «СЛАБЫЕ МЕСТА» ─────────────────────────
@@ -1001,14 +1023,13 @@ async def main() -> None:
         # ☁️ Облачный режим (Render и любой хостинг с HTTPS-URL): webhook.
         # Телеграм сам присылает апдейты на URL — держать соединение не надо,
         # переживает сон free-тарифа. Плюс поднимаем Mini App и /api/*.
+        # Порядок важен: СНАЧАЛА биндим порт (Render health-check), ПОТОМ Telegram —
+        # чтобы сетевой чих Телеграма не ронял весь деплой.
         from aiohttp import web
         from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
         secret = os.environ.get("WEBHOOK_SECRET", "psl-webhook-secret-поменяй")
         hook_path = f"/webhook/{secret}"
-        await bot.set_webhook(
-            f"{PUBLIC_BASE_URL}{hook_path}", secret_token=secret, drop_pending_updates=True
-        )
         app = web.Application()
 
         async def health(_request: object) -> object:
@@ -1022,6 +1043,21 @@ async def main() -> None:
         mog_api.register_webapp(app, bot)
         setup_application(app, dp, bot=bot)
 
+        port = int(os.environ.get("PORT", "8080"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        log.info("webhook-режим: %s (порт %d), Mini App: %s/app", PUBLIC_BASE_URL, port, PUBLIC_BASE_URL)
+
+        # Telegram-настройка уже после бинда порта.
+        try:
+            await bot.set_webhook(
+                f"{PUBLIC_BASE_URL}{hook_path}", secret_token=secret, drop_pending_updates=True
+            )
+            log.info("webhook установлен: %s%s", PUBLIC_BASE_URL, hook_path)
+        except Exception:  # noqa: BLE001
+            log.exception("set_webhook не удался — апдейты не придут, но health-check жив")
+
         # Кнопка-меню "открыть MOG" во всех чатах.
         try:
             await bot.set_chat_menu_button(
@@ -1030,11 +1066,6 @@ async def main() -> None:
         except Exception:  # noqa: BLE001 — кнопка не критична
             log.warning("set_chat_menu_button не удалось", exc_info=True)
 
-        port = int(os.environ.get("PORT", "8080"))
-        log.info("webhook-режим: %s (порт %d), Mini App: %s/app", PUBLIC_BASE_URL, port, PUBLIC_BASE_URL)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", port).start()
         await asyncio.Event().wait()  # висим вечно
     else:
         # 💻 Локальный режим: polling, полная биометрия если установлена.
