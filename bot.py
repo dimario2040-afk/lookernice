@@ -1028,7 +1028,18 @@ async def main() -> None:
         from aiohttp import web
         from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-        secret = os.environ.get("WEBHOOK_SECRET", "psl-webhook-secret-поменяй")
+        # Telegram разрешает в secret_token только [A-Za-z0-9_-]{1,256}.
+        # Пустой/невалидный WEBHOOK_SECRET (в т.ч. старый дефолт с кириллицей) —
+        # молча заменяем случайным валидным, иначе set_webhook падает с Bad Request.
+        import re
+        import secrets as _secrets
+
+        _raw_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+        if _raw_secret and re.fullmatch(r"[A-Za-z0-9_-]{1,256}", _raw_secret):
+            secret = _raw_secret
+        else:
+            secret = _secrets.token_urlsafe(24)[:32]
+            log.warning("WEBHOOK_SECRET пуст/невалиден — сгенерирован случайный, webhook пересоздастся")
         hook_path = f"/webhook/{secret}"
         app = web.Application()
 
