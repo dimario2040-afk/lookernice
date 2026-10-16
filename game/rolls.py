@@ -1,7 +1,8 @@
 """Математика ролла MOG.
 
 base детерминированно из sha256(фото) → одна фотка всегда даёт одну базу.
-Поверх — шум ±0.3 (нормальное), редкий крит (+0.5..0.8, Mythic) и провал (−0.5).
+Поверх — шум (нормальное), редкий крит (Mythic) и провал.
+Шкала MOG: 0.0000 – 9.9999 (4 знака).
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ def _hash_int(data: bytes) -> int:
 
 
 def base_score(photo_bytes: bytes) -> float:
-    """Детерминированная база 2.0–4.4 из содержимого фото."""
+    """Детерминированная база 2.5–8.5 из содержимого фото."""
     h = _hash_int(photo_bytes)
     frac = (h % 1_000_000) / 1_000_000
     return config.BASE_MIN + frac * (config.BASE_MAX - config.BASE_MIN)
@@ -139,12 +140,12 @@ def roll(
     noise = random.gauss(0.0, config.ROLL_SIGMA)
     score = base + noise + bonus
     score = max(config.SCORE_MIN, min(config.SCORE_MAX, score))
-    score = round(score, 2)
+    score = round(score, 4)
 
     tier = tier_for(score, crit=crit)
     return {
         "score": score,
-        "base": round(base, 2),
+        "base": round(base, 4),
         "tier": tier,
         "crit": crit,
         "failed": failed,

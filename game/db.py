@@ -327,3 +327,15 @@ async def finish_battle(battle_id: int, winner_id: int | None) -> None:
         "UPDATE battles SET status='done', winner_id=? WHERE id=?", (winner_id, battle_id)
     )
     await _db.commit()
+
+
+async def find_pending_battle(chat_id: int, opponent_id: int) -> dict | None:
+    """Свежий незакрытый батл в этом чате, где юзер — оппонент (ждёт его фото)."""
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT * FROM battles WHERE chat_id=? AND opponent_id=? AND status='pending'"
+        " ORDER BY id DESC LIMIT 1",
+        (chat_id, opponent_id),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None

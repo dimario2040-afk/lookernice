@@ -44,6 +44,16 @@ MODEL_API_KEY = os.getenv("MODEL_API_KEY", "")
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 MODEL_NAME = os.getenv("MODEL_NAME", "glm-4.6v-flash")
 
+# Free vision-модели по приоритету. На z.ai единственная бесплатная vision —
+# glm-4.6v-flash (glm-4.6v/4.5v платные, прочие имена не существуют).
+# Переопределяется env MODEL_FALLBACKS (через запятую) под другой провайдер.
+MODEL_FALLBACKS = [
+    m.strip()
+    for m in os.getenv("MODEL_FALLBACKS", "glm-4.6v-flash").split(",")
+    if m.strip()
+]
+MODEL_CANDIDATES = [MODEL_NAME] + [m for m in MODEL_FALLBACKS if m != MODEL_NAME]
+
 # Публичный HTTPS-URL (Render задаёт RENDER_EXTERNAL_URL; PUBLIC_URL — для прочего
 # хостинга). Нужен для Mini App и webhook. Пусто = локальный polling без мини-аппа.
 PUBLIC_BASE_URL = (
@@ -285,6 +295,72 @@ lower third, bigonial width, zygos, anti-fraud (ракурс/свет), softmaxx
 """
 
 # ---------------------------------------------------------------- мозги (VLM)
+def _vision_chat(messages: list, *, max_tokens: int, temperature: float = 0.9):
+    """Вызов VLM с авто-фолбэком по free-моделям и ретраями на 429/5xx.
+
+    z.ai free-модели периодически отвечают 429 (code 1305, «перегружено») —
+    short retry + переход к следующей модели, чтобы юзер получал ответ.
+    """
+    import time
+
+    from openai import (
+        APIConnectionError,
+        APIStatusError,
+        APITimeoutError,
+        OpenAI,
+        RateLimitError,
+    )
+
+    client = OpenAI(api_key=MODEL_API_KEY, base_url=MODEL_BASE_URL)
+    last_exc: Exception | None = None
+    busy = True  # если всё упало только на 429 — это перегрузка, а не наш баг
+    for model in MODEL_CANDIDATES:
+        for attempt in range(3):
+            try:
+                return client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except (RateLimitError, APIConnectionError, APITimeoutError) as exc:
+                last_exc = exc
+                busy = True
+                log.warning("model %s try %d: %s", model, attempt + 1, str(exc)[:120])
+                time.sleep(min(6.0, 1.5 * (attempt + 1)))
+            except APIStatusError as exc:
+                last_exc = exc
+                if getattr(exc, "status_code", 0) >= 500:
+                    busy = True
+                    log.warning("model %s 5xx try %d: %s", model, attempt + 1, str(exc)[:120])
+                    time.sleep(1.5 * (attempt + 1))
+                else:
+                    busy = False
+                    log.warning("model %s %s: %s", model, exc.status_code, str(exc)[:120])
+                    break  # 4xx кроме 429 — сразу к следующей модели
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                busy = False
+                log.warning("model %s err: %s", model, str(exc)[:120])
+                break
+    if busy:
+        raise RuntimeError("MODEL_BUSY: бесплатная vision-модель перегружена (429/1305)")
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("нет доступной VLM-модели")
+
+
+def _friendly_error(exc: Exception) -> str:
+    """Человеческое сообщение вместо сырого 429/1305."""
+    s = str(exc)
+    if "MODEL_BUSY" in s or "429" in s or "1305" in s:
+        return (
+            "🧠 Нейронка сейчас перегружена (бесплатная модель). "
+            "Кинь фото через минуту — вернётся. Скан «Слабые места» работает всегда."
+        )
+    return f"💥 Упал с ошибкой: {exc}"
+
+
 # Провайдер-агностик: любой OpenAI-совместимый endpoint с vision-моделью.
 # Дефолт — Zhipu (z.ai, регистрация по email, бесплатный glm-4.6v-flash).
 # Через env переключается на что угодно (Qwen, Gemini-OAI, OpenRouter…).
@@ -292,34 +368,27 @@ def analyze_with_vlm(photo_bytes: bytes, metrics_text: str) -> str:
     """Отправляет фото + метрики в VLM, возвращает разбор."""
     import base64
 
-    from openai import OpenAI
-
-    client = OpenAI(api_key=MODEL_API_KEY, base_url=MODEL_BASE_URL)
     b64 = base64.b64encode(photo_bytes).decode("utf-8")
-    resp = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": f"Биометрия лица (факты от MediaPipe): {metrics_text}\n\n"
-                        "Разъеби по схеме из системного промпта. Жёстко, по делу.",
-                    },
-                ],
-            },
-        ],
-        temperature=0.9,
-        # 4096: reasoning-модели (GLM-4.6v) тратят токены на размышления,
-        # при 2048 ответ обрывался на полуслове (finish_reason=length).
-        max_tokens=4096,
-    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                },
+                {
+                    "type": "text",
+                    "text": f"Биометрия лица (факты от MediaPipe): {metrics_text}\n\n"
+                    "Разъеби по схеме из системного промпта. Жёстко, по делу.",
+                },
+            ],
+        },
+    ]
+    # 4096: reasoning-модели (GLM-4.6v) тратят токены на размышления,
+    # при 2048 ответ обрывался на полуслове (finish_reason=length).
+    resp = _vision_chat(messages, max_tokens=4096)
     finish = ""
     try:
         text = (resp.choices[0].message.content or "").strip()
@@ -360,6 +429,12 @@ SIMPLE_PROMPT = """Ты — друг-карикатурист: описывае�
 профессию, точный возраст. Не знаешь — шути, а не выдумывай.
 Жесть, цифры и диагнозы — НЕ твоя задача, их выдаст другой режим по кнопке.
 Если биометрия недоступна — смотри только фото.
+
+ГЛАВНОЕ ПРАВИЛО: описывай смешно ЛЮБОЕ фото. Даже если это НЕ лицо (кот, еда,
+пейзаж, мем, скриншот, размытое пятно, палец на камере) — СДЕЛАЙ ВИД, что это
+лицо героя, и опиши его как лицо: «кости», «взгляд», «характер», «скулы».
+Чем абсурднее исходник, тем смешнее. НИКОГДА не пиши «это не лицо» и не
+отказывайся — обыграй абсурд как фишку героя.
 """
 
 SIMPLE_PROMPT_SOFT = """Ты — автор добрых дружеских шаржей для развлекательного теста.
@@ -367,37 +442,32 @@ SIMPLE_PROMPT_SOFT = """Ты — автор добрых дружеских ша
 комплименты с юмором, яркие сравнения с героями фильмов и животными.
 Простыми словами, без терминов и цифр. Два абзаца, русский язык.
 Описывай только то, что видно на фото, ничего не выдумывай.
+Даже если это не лицо (кот, еда, предмет) — сделай вид, что это лицо героя,
+и опиши смешно. Никогда не отказывайся.
 """
 
 
 def _simple_call(system_prompt: str, photo_b64: str, metrics_text: str):
     """Один вызов simple-слоя. Может кинуть исключение (в т.ч. 1301 фильтр)."""
-    from openai import OpenAI
-
-    client = OpenAI(api_key=MODEL_API_KEY, base_url=MODEL_BASE_URL)
-    return client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": f"Замеры для ориентира (не озвучивай цифры): {metrics_text}\n\n"
-                        "Опиши человека простыми словами по схеме из системного промпта.",
-                    },
-                ],
-            },
-        ],
-        temperature=0.9,
-        # 2048: reasoning съедает бюджет, при 800 контент приходил пустым.
-        max_tokens=2048,
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"},
+                },
+                {
+                    "type": "text",
+                    "text": f"Замеры для ориентира (не озвучивай цифры): {metrics_text}\n\n"
+                    "Опиши человека простыми словами по схеме из системного промпта.",
+                },
+            ],
+        },
+    ]
+    # 2048: reasoning съедает бюджет, при 800 контент приходил пустым.
+    return _vision_chat(messages, max_tokens=2048)
 
 
 def _extract_text(resp) -> tuple[str, str]:
@@ -472,6 +542,7 @@ async def cmd_help(msg: Message) -> None:
 async def cmd_mog(msg: Message) -> None:
     """Публичный вызов на мог-батл: ответь на сообщение + /mog или /mog @user."""
     from game import battles as mog_battles
+    from game import db as mog_db
 
     opponent = None
     target = msg.reply_to_message
@@ -500,27 +571,31 @@ async def cmd_mog(msg: Message) -> None:
         await msg.reply(f"💥 Не смог создать батл: {exc}")
         return
 
-    if not PUBLIC_BASE_URL:
-        await msg.reply("⚔️ Батл создан, но мини-апп выключен (нет PUBLIC_URL).")
-        return
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⚔️ Принять бой",
-                    web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/app?battle={battle_id}"),
-                )
-            ]
-        ]
-    )
-    await msg.reply(
+    text = (
         f"⚔️ <b>{challenger['name']}</b> вызывает <b>{opponent['name']}</b> "
-        f"на МОГ-БАТТЛ!\nКто кого смог — {opponent['name']}, кидай фото в приложении.",
-        reply_markup=kb,
-        parse_mode="HTML",
+        "на МОГ-БАТТЛ!\n\n"
+        f"{opponent['name']}, просто пришли <b>своё фото</b> в этот чат — и бой закрыт. "
+        "Кто кого смог."
     )
-
+    trial = await mog_db.get_battle(battle_id)
+    if trial and not trial["challenger_score"]:
+        text += (
+            "\n\n⚠️ У вызывающего ещё нет ролла — его счёт 0.0000. "
+            "Пусть сначала кинет фото в чат."
+        )
+    kb = None
+    if PUBLIC_BASE_URL:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⚔️ Принять бой (мини-апп)",
+                        web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/app?battle={battle_id}"),
+                    )
+                ]
+            ]
+        )
+    await msg.reply(text, reply_markup=kb, parse_mode="HTML")
 
 # ---------------------------------------------------------------- Stars (оплата)
 @dp.message(Command("buy"))
@@ -590,9 +665,9 @@ def _mog_tag(photo_bytes: bytes) -> str:
     from game import config as mog_config
     from game import rolls as mog_rolls
 
-    score = round(mog_rolls.base_score(photo_bytes), 2)
+    score = round(mog_rolls.base_score(photo_bytes), 4)
     tier = mog_rolls.tier_for(score)
-    return f"\n\n🎲 <b>МОГ: {score:.2f} · {tier}</b>\n<i>{mog_config.DISCLAIMER}</i>"
+    return f"\n\n🎲 <b>МОГ: {score:.4f} · {tier}</b>\n<i>{mog_config.DISCLAIMER}</i>"
 
 
 # ───────────────────────── НЕОН-СКАН «СЛАБЫЕ МЕСТА» ─────────────────────────
@@ -760,6 +835,21 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         photo_bytes = await bot.download_file(tg_file.file_path)
         raw = photo_bytes.read()
 
+        # ⚔️ ДУЭЛЬ: если этого юзера вызвали на бой — его фото закрывает батл.
+        # Работает прямо в чате, без мини-аппа и без HTTPS.
+        try:
+            from game import battles as mog_battles
+            from game import db as mog_db
+            from game import rolls as mog_rolls
+
+            pending = await mog_db.find_pending_battle(msg.chat.id, msg.from_user.id)
+            if pending:
+                duel_score = mog_rolls.roll(raw)["score"]
+                res = await mog_battles.resolve(pending["id"], duel_score)
+                await msg.reply(mog_battles.result_text(res), parse_mode="HTML")
+        except Exception:  # noqa: BLE001 — батл не должен ронять обычный разбор
+            log.exception("battle resolve failed")
+
         # 1. Локальная биометрия (в треде, чтобы не блочить loop).
         # В лайт-режиме хостинга её нет — сразу идём к нейронке по фото.
         if BIOMETRY_AVAILABLE:
@@ -768,15 +858,11 @@ async def on_photo(msg: Message, bot: Bot) -> None:
                 tmp_path = tmp.name
 
             metrics = await asyncio.to_thread(analyze_face, tmp_path)
-            if not metrics.get("face_found"):
-                await status.edit_text(
-                    "❌ Лицо не найдено. Кинь фото где ебало видно чётко: "
-                    "свет, фокус, без очков."
-                )
-                return
+            # Числа — ПОД КАПОТ: в чат не показываем, только по кнопке «🧬 Замеры».
+            # Нет лица — не блокируем: разбор всё равно даём (99,9% фото).
             metrics_text = format_metrics(metrics)
             log.info("metrics: %s", metrics_text)
-            await status.edit_text(f"📐 Биометрия: {metrics_text}\n\n🧠 Нейронка думает…")
+            await status.edit_text("🧠 Нейронка думает…")
         else:
             metrics_text = format_metrics({"face_found": False, "error": "biometry_unavailable"})
 
@@ -790,6 +876,7 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             inline_keyboard=[
                 [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
                 [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
+                [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
             ]
         )
         await status.delete()
@@ -811,7 +898,7 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             )
     except Exception as exc:  # noqa: BLE001 — юзер должен видеть ошибку текстом
         log.exception("photo handling failed")
-        await msg.answer(f"💥 Упал с ошибкой: {exc}\nПопробуй другое фото.")
+        await msg.answer(_friendly_error(exc) + "\nПопробуй другое фото.")
         try:
             await status.delete()
         except Exception:  # noqa: BLE001, S110
@@ -840,7 +927,7 @@ async def on_full_roast(cb: CallbackQuery, bot: Bot) -> None:
         # Полный разбор (в треде — сетевой вызов синхронный)
         verdict = await asyncio.to_thread(analyze_with_vlm, raw, metrics_text)
 
-        header = f"📐 Замеры: {metrics_text}\n\n"
+        header = ""
         # Режем длинные ответы под лимит TG (4096)
         chunk_size = 4000 - len(header)
         first = True
@@ -851,7 +938,7 @@ async def on_full_roast(cb: CallbackQuery, bot: Bot) -> None:
         await status.delete()
     except Exception as exc:  # noqa: BLE001
         log.exception("full roast failed")
-        await cb.message.answer(f"💥 Упал с ошибкой: {exc}\nПопробуй ещё раз кнопкой.")
+        await cb.message.answer(_friendly_error(exc) + "\nПопробуй ещё раз кнопкой.")
         try:
             await status.delete()
         except Exception:  # noqa: BLE001, S110
@@ -880,6 +967,21 @@ async def on_weakspots(cb: CallbackQuery, bot: Bot) -> None:
     except Exception as exc:  # noqa: BLE001
         log.exception("weakspots failed")
         await cb.message.answer(f"💥 Не смог нарисовать скан: {exc}")
+
+
+@dp.callback_query(F.data == "metrics")
+async def on_metrics(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка 'Замеры (тех)': сырые числа биометрии — только по запросу, под капот."""
+    data = _pending_full.get(cb.from_user.id)
+    if not data:
+        await cb.answer("Фото устарело — кинь заново 👇", show_alert=True)
+        return
+    await cb.answer("Под капот…")
+    _raw, metrics_text = data
+    await cb.message.answer(
+        f"🧬 <b>ТЕХ-ЗАМЕРЫ</b> <i>(под капот)</i>\n<code>{metrics_text}</code>",
+        parse_mode="HTML",
+    )
 
 
 async def main() -> None:

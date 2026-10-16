@@ -18,21 +18,22 @@ FREE_ROLLS_PER_DAY = 3           # бесплатных роллов в день
 INVITE_ROLLS_CAP = 3             # максимум рероллов за инвайты в день
 
 # ---------------------------------------------------------------- математика ролла
-ROLL_SIGMA = 0.18                # std шума: ~90% попадают в ±0.3
+# Шкала MOG: 0.0000 – 9.9999 (показываем 4 знака после запятой).
+ROLL_SIGMA = 0.45                # std шума (в единицах шкалы 0–10)
 CRIT_CHANCE = 0.02               # 2% крит
-CRIT_BONUS_MIN = 0.5
-CRIT_BONUS_MAX = 0.8
+CRIT_BONUS_MIN = 1.25
+CRIT_BONUS_MAX = 2.0
 FAIL_CHANCE = 0.03               # 3% провал
-FAIL_PENALTY = 0.5
-SCORE_MIN = 1.0
-SCORE_MAX = 5.0
-BASE_MIN = 2.0                   # база из хэша фото
-BASE_MAX = 4.4
+FAIL_PENALTY = 1.25
+SCORE_MIN = 0.0
+SCORE_MAX = 9.9999
+BASE_MIN = 2.5                   # база из хэша фото
+BASE_MAX = 8.5
 
 # Границы тиров (по score; Mythic — только крит).
-TIER_RARE = 2.5
-TIER_EPIC = 3.2
-TIER_LEGENDARY = 3.91
+TIER_RARE = 3.75
+TIER_EPIC = 5.5
+TIER_LEGENDARY = 7.28
 
 # TTL хранения байтов фото в памяти (не на диске!).
 PHOTO_TTL_SECONDS = 15 * 60

@@ -58,7 +58,7 @@ def result_text(r: dict) -> str:
     cs, os_ = r["challenger_score"], r["opponent_score"]
 
     if r["winner_id"] is None:
-        head = f"🤝 <b>НИЧЬЯ</b> — оба на {cs:.2f}. Так себе мог."
+        head = f"🤝 <b>НИЧЬЯ</b> — оба на {cs:.4f}. Так себе мог."
     elif r["winner_id"] == r["challenger_id"]:
         head = f"💀 <b>{c} СМОГНУЛ {o}</b>"
     else:
@@ -66,7 +66,7 @@ def result_text(r: dict) -> str:
 
     return (
         f"⚔️ МОГ-БАТТЛ #{r['battle_id']}\n"
-        f"{c}: <b>{cs:.2f}</b>  ·  {o}: <b>{os_:.2f}</b>\n\n"
+            f"{c}: <b>{cs:.4f}</b>  ·  {o}: <b>{os_:.4f}</b>\n\n"
         f"{head}\n\n"
         "<i>MOG — игра. Баллы случайны, не оценка внешности.</i>"
     )

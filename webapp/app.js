@@ -70,7 +70,7 @@
     state.catalog = d.catalog || {};
     $("chip-rolls").textContent = d.rolls_left + state.bonusRolls;
     $("chip-crits").textContent = d.crits;
-    $("chip-best").textContent = d.best_roll ? d.best_roll.score.toFixed(2) : "—";
+    $("chip-best").textContent = d.best_roll ? d.best_roll.score.toFixed(4) : "—";
     updateAgainPill();
     updateCritBtn();
   }
@@ -179,14 +179,14 @@
   function animateRoll(d) {
     return new Promise((resolve) => {
       const scoreEl = $("card-score");
-      const start = 1.0, target = d.score;
+      const start = 0.0, target = d.score;
       const t0 = performance.now(), dur = 750;
       function frame(t) {
         const k = Math.min(1, (t - t0) / dur);
         const eased = 1 - Math.pow(1 - k, 3);
-        scoreEl.textContent = (start + (target - start) * eased).toFixed(2);
+        scoreEl.textContent = (start + (target - start) * eased).toFixed(4);
         if (k < 1) requestAnimationFrame(frame);
-        else { scoreEl.textContent = target.toFixed(2); resolve(); }
+        else { scoreEl.textContent = target.toFixed(4); resolve(); }
       }
       requestAnimationFrame(frame);
     });
@@ -196,7 +196,7 @@
     const card = $("card");
     card.className = "card t-" + d.tier;
     $("card-tier").textContent = d.tier;
-    $("card-score").textContent = d.score.toFixed(2);
+    $("card-score").textContent = d.score.toFixed(4);
     $("card-roast").textContent = d.roast || "";
     $("card-crit").classList.toggle("hidden", !d.crit);
     $("card-face").textContent = d.crit ? "💎" : (d.failed ? "💀" : "🫥");
@@ -219,7 +219,7 @@
     haptic("light");
     const d = state.lastRoll;
     const text = d
-      ? "Я могнул на " + d.score.toFixed(2) + " (" + d.tier + ")! А ты? 🎰"
+      ? "Я могнул на " + d.score.toFixed(4) + " (" + d.tier + ")! А ты? 🎰"
       : "Проверь себя в MOG 🎰";
     await shareText(text);
   });
@@ -275,7 +275,7 @@
     const b = r.data;
     $("battle-info").innerHTML =
       "Ты: <b>" + esc(b.opponent.name) + "</b><br>Против: <b>" + esc(b.challenger.name) +
-      "</b> (" + Number(b.challenger.score).toFixed(2) + ")<br><br>" +
+      "</b> (" + Number(b.challenger.score).toFixed(4) + ")<br><br>" +
       "Кидай своё фото — кто кого смог.";
     if (b.status !== "pending") {
       $("battle-info").innerHTML += "<br><br>Этот батл уже закрыт.";
@@ -295,8 +295,8 @@
     const win = r.data.winner_id;
     const myId = tg && tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : null;
     $("battle-info").innerHTML =
-      "Ты: <b>" + Number(res.opponent_score).toFixed(2) + "</b><br>" +
-      "Против: <b>" + Number(res.challenger_score).toFixed(2) + "</b><br><br>" +
+      "Ты: <b>" + Number(res.opponent_score).toFixed(4) + "</b><br>" +
+      "Против: <b>" + Number(res.challenger_score).toFixed(4) + "</b><br><br>" +
       (win === null ? "🤝 Ничья!" : (win === myId ? "💀 ТЫ СМОГНУЛ!" : "💀 Тебя смогнули"));
     $("btn-battle-photo").classList.add("hidden");
     state.battleId = null;
@@ -314,7 +314,7 @@
       r.data.top.forEach((row) => {
         const li = document.createElement("li");
         li.innerHTML = '<span class="rk">' + row.rank + '</span><span class="nm">' + esc(row.name) +
-          '</span><span class="sc">' + Number(row.score).toFixed(2) + '</span>';
+          '</span><span class="sc">' + Number(row.score).toFixed(4) + '</span>';
         list.appendChild(li);
       });
       if (!r.data.top.length) list.innerHTML = "<li>Пока пусто — будь первым могером.</li>";
