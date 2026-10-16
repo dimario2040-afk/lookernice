@@ -126,12 +126,22 @@ async def grant(payload: str) -> dict | None:
     product = config.STARS_CATALOG.get(product_key)
     if not product:
         return None
+
+    # 🎁 Подарок: одноразовый токен, который юзер перешлёт другу.
+    gift_kind = product.get("gift")
+    if gift_kind:
+        token = await db.create_gift_token(gift_kind, user_id)
+        log.info("grant gift %s -> token (by %s)", gift_kind, user_id)
+        return {**product, "gift_kind": gift_kind, "gift_token": token}
+
     await db.add_purchase(user_id, rolls=int(product.get("rolls", 0)), crit=int(product.get("crit", 0)))
     log.info("grant %s -> user %s (+%s rolls, +%s crit)", product_key, user_id, product.get("rolls", 0), product.get("crit", 0))
     return product
 
 
 def grant_text(product: dict) -> str:
+    if product.get("gift_token"):
+        return "Подарок готов — перешли сообщение другу 👇"
     if product.get("artifact_key"):
         return (
             f"Артефакт прикреплён к бою #{product['battle_id']}. "

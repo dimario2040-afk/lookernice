@@ -97,6 +97,23 @@ CREATE TABLE IF NOT EXISTS consents (
     version    TEXT    NOT NULL DEFAULT '',
     created_at TEXT    NOT NULL DEFAULT ''
 );
+
+-- 🎁 Кредиты подарочных фич (реролл/студия), начисляются за подарок.
+CREATE TABLE IF NOT EXISTS credits (
+    user_id INTEGER NOT NULL,
+    kind    TEXT    NOT NULL,
+    qty     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(user_id, kind)
+);
+
+-- 🎁 Одноразовые подарочные токены: создал — подарил — кто-то забрал.
+CREATE TABLE IF NOT EXISTS gift_tokens (
+    token      TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT '',
+    claimed_by INTEGER
+);
 """
 
 
@@ -541,3 +558,76 @@ async def record_consent(user_id: int, version: str) -> str:
     )
     await _db.commit()
     return ts
+
+
+# ---------------------------------------------------------------- кредиты/подарки
+
+
+async def add_credit(user_id: int, kind: str, n: int = 1) -> int:
+    """Начисляет кредит (реролл/студия). Возвращает новый остаток."""
+    assert _db is not None
+    await _db.execute(
+        "INSERT INTO credits (user_id, kind, qty) VALUES (?,?,?)"
+        " ON CONFLICT(user_id, kind) DO UPDATE SET qty = qty + excluded.qty",
+        (user_id, kind, int(n)),
+    )
+    await _db.commit()
+    cur = await _db.execute(
+        "SELECT qty FROM credits WHERE user_id=? AND kind=?", (user_id, kind)
+    )
+    row = await cur.fetchone()
+    return int(row["qty"]) if row else 0
+
+
+async def get_credits(user_id: int) -> dict[str, int]:
+    """Все ненулевые кредиты юзера: {kind: qty}."""
+    assert _db is not None
+    cur = await _db.execute("SELECT kind, qty FROM credits WHERE user_id=?", (user_id,))
+    return {r["kind"]: int(r["qty"]) for r in await cur.fetchall() if int(r["qty"]) > 0}
+
+
+async def spend_credit(user_id: int, kind: str) -> bool:
+    """Списывает 1 кредит. True — если списание прошло (был остаток)."""
+    assert _db is not None
+    cur = await _db.execute(
+        "UPDATE credits SET qty = qty - 1 WHERE user_id=? AND kind=? AND qty > 0",
+        (user_id, kind),
+    )
+    await _db.commit()
+    return cur.rowcount > 0
+
+
+async def create_gift_token(kind: str, created_by: int) -> str:
+    """Создаёт одноразовый подарочный токен. Возвращает token."""
+    import secrets
+
+    assert _db is not None
+    token = secrets.token_urlsafe(9)
+    await _db.execute(
+        "INSERT INTO gift_tokens (token, kind, created_by, created_at) VALUES (?,?,?,?)",
+        (token, kind, created_by, _now()),
+    )
+    await _db.commit()
+    return token
+
+
+async def claim_gift_token(token: str, user_id: int) -> tuple[bool, str, str]:
+    """Атомарно забирает подарок. Возвращает (ok, kind, reason)."""
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT kind, created_by, claimed_by FROM gift_tokens WHERE token=?", (token,)
+    )
+    row = await cur.fetchone()
+    if not row:
+        return False, "", "not_found"
+    if row["claimed_by"] is not None:
+        return False, row["kind"], "used"
+    upd = await _db.execute(
+        "UPDATE gift_tokens SET claimed_by=? WHERE token=? AND claimed_by IS NULL",
+        (user_id, token),
+    )
+    await _db.commit()
+    if upd.rowcount == 0:
+        return False, row["kind"], "used"
+    await add_credit(user_id, row["kind"], 1)
+    return True, row["kind"], "ok"

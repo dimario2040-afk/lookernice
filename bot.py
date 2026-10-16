@@ -804,21 +804,36 @@ async def cmd_mog(msg: Message) -> None:
     await msg.reply(text, reply_markup=kb, parse_mode="HTML")
 
 
-def _card_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки под МОГ-карточкой (используются и в реролле)."""
+def _card_keyboard(credits: dict[str, int] | None = None) -> InlineKeyboardMarkup:
+    """Кнопки под МОГ-карточкой. Учитывает подарочные кредиты (бесплатный реролл/студия)."""
+    cr = credits or {}
+    reroll_label = "🔄 Ещё раз" + (" — бесплатно 🎁" if cr.get("reroll") else " — 15 ⭐")
+    studio_label = "🎨 Студия" + (" — бесплатно 🎁" if cr.get("studio") else " — 35 ⭐")
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="⚔️ Дуэль 1×1", callback_data="duel_new"),
                 InlineKeyboardButton(text="🏆 Общий баттл", callback_data="arena_quick"),
             ],
-            [InlineKeyboardButton(text="🔄 Ещё раз — 15 ⭐", callback_data="reroll")],
-            [InlineKeyboardButton(text="🎨 Студия (ретушь) — 35 ⭐", callback_data="studio")],
+            [InlineKeyboardButton(text=reroll_label, callback_data="reroll")],
+            [InlineKeyboardButton(text=studio_label, callback_data="studio")],
+            [InlineKeyboardButton(text="🎁 Подарить", callback_data="gift")],
             [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
             [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
             [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
         ]
     )
+
+
+async def _card_keyboard_for(user_id: int) -> InlineKeyboardMarkup:
+    """Карточка с учётом кредитов юзера (показать «бесплатно 🎁»)."""
+    from game import db as mog_db
+
+    try:
+        credits = await mog_db.get_credits(user_id)
+    except Exception:  # noqa: BLE001 — БД не критична для клавиатуры
+        credits = {}
+    return _card_keyboard(credits)
 
 
 def _duel_keyboard(battle_id: int, *, open_challenge: bool):
@@ -1233,10 +1248,16 @@ async def on_buy(cb: CallbackQuery, bot: Bot) -> None:
 @dp.callback_query(F.data == "reroll")
 async def on_reroll(cb: CallbackQuery, bot: Bot) -> None:
     """Кнопка под карточкой: платный реролл ТОГО ЖЕ фото (байты из памяти)."""
+    from game import db as mog_db
     from game import payments
 
     if cb.from_user.id not in _pending_full:
         await cb.answer("📸 Фото уже вышло из памяти — просто кинь его заново.", show_alert=True)
+        return
+    # 🎁 Подарочный кредит — реролл бесплатно (без счёта).
+    if await mog_db.spend_credit(cb.from_user.id, "reroll"):
+        await cb.answer("🎁 Реролл бесплатный — считаю!")
+        await _do_reroll(cb.message, cb.from_user.id)
         return
     try:
         await payments.send_invoice(bot, cb.message.chat.id, "reroll", cb.from_user.id)
@@ -1272,7 +1293,7 @@ async def _do_reroll(msg: Message, user_id: int) -> None:
                 + _legal_micro()
             ),
             parse_mode="HTML",
-            reply_markup=_card_keyboard(),
+            reply_markup=await _card_keyboard_for(user_id),
         )
     except Exception:  # noqa: BLE001
         log.exception("reroll card failed")
@@ -1283,10 +1304,16 @@ async def _do_reroll(msg: Message, user_id: int) -> None:
 @dp.callback_query(F.data == "studio")
 async def on_studio(cb: CallbackQuery, bot: Bot) -> None:
     """Кнопка под карточкой: платная ванити-ретушь ТОГО ЖЕ фото (байты из памяти)."""
+    from game import db as mog_db
     from game import payments
 
     if cb.from_user.id not in _pending_full:
         await cb.answer("📸 Фото уже вышло из памяти — кинь его заново.", show_alert=True)
+        return
+    # 🎁 Подарочный кредит — Студия бесплатно (без счёта).
+    if await mog_db.spend_credit(cb.from_user.id, "studio"):
+        await cb.answer("🎁 Студия бесплатная — ретуширую!")
+        await _do_studio(cb.message, cb.from_user.id)
         return
     try:
         await payments.send_invoice(bot, cb.message.chat.id, "studio", cb.from_user.id)
@@ -1317,11 +1344,89 @@ async def _do_studio(msg: Message, user_id: int) -> None:
                 + _legal_micro()
             ),
             parse_mode="HTML",
-            reply_markup=_card_keyboard(),
+            reply_markup=await _card_keyboard_for(user_id),
         )
     except Exception:  # noqa: BLE001
         log.exception("studio card failed")
         await msg.answer("🎨 Не смог обработать — попробуй ещё раз.")
+
+
+# ------------------------------------------------------- подарки (🎁, 15/35 ⭐)
+_GIFT_LABEL = {"reroll": "🔄 Реролл", "studio": "🎨 Студия"}
+
+
+@dp.callback_query(F.data == "gift")
+async def on_gift(cb: CallbackQuery) -> None:
+    """Меню подарков: что подарить другу."""
+    rows = [
+        [InlineKeyboardButton(text="🔄 Реролл — 15 ⭐", callback_data="gift_buy:reroll")],
+        [InlineKeyboardButton(text="🎨 Студия — 35 ⭐", callback_data="gift_buy:studio")],
+    ]
+    await cb.message.answer(
+        "🎁 <b>Подарок другу</b>\n"
+        "Выбери, что подарить — бот выдаст карточку-подарок, перешли её другу. "
+        "Кто первый нажмёт «Забрать» — тому и достанется.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("gift_buy:"))
+async def on_gift_buy(cb: CallbackQuery, bot: Bot) -> None:
+    from game import payments
+
+    kind = (cb.data or "").split(":", 1)[-1]
+    if kind not in _GIFT_LABEL:
+        await cb.answer("Неизвестный подарок.", show_alert=True)
+        return
+    try:
+        await payments.send_invoice(bot, cb.message.chat.id, f"gift_{kind}", cb.from_user.id)
+        await cb.answer("Счёт на подарок отправлен ⭐")
+    except Exception:  # noqa: BLE001
+        log.exception("gift invoice failed")
+        await cb.answer(PUBLIC_ERROR, show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("gift_claim:"))
+async def on_gift_claim(cb: CallbackQuery) -> None:
+    from game import db as mog_db
+
+    token = (cb.data or "").split(":", 1)[-1]
+    ok, kind, reason = await mog_db.claim_gift_token(token, cb.from_user.id)
+    if not ok:
+        note = {
+            "used": "😔 Этот подарок уже забрали.",
+            "not_found": "Подарок не найден.",
+        }.get(reason, "Не получилось забрать подарок.")
+        await cb.answer(note, show_alert=True)
+        return
+    label = _GIFT_LABEL.get(kind, kind)
+    await cb.message.answer(
+        f"🎉 <b>Тебе подарок: {label}!</b>\n"
+        f"Кинь фото — и жми «{label} — бесплатно 🎁» под карточкой 👇",
+        parse_mode="HTML",
+    )
+    await cb.answer("Подарок твой 🎁")
+
+
+async def _send_gift(msg: Message, product: dict) -> None:
+    """Выдаёт пересылаемую карточку-подарок с кнопкой «Забрать»."""
+    kind = product.get("gift_kind") or product.get("gift") or ""
+    token = product.get("gift_token") or ""
+    label = _GIFT_LABEL.get(kind, kind)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Забрать подарок", callback_data=f"gift_claim:{token}")]
+        ]
+    )
+    await msg.answer(
+        f"🎁 <b>Подарок готов: {label}</b>\n\n"
+        "Перешли это сообщение другу — кто первый нажмёт «Забрать», "
+        "тому подарок и достанется.\n\n" + _legal_micro(),
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 
 
 @dp.pre_checkout_query()
@@ -1344,6 +1449,9 @@ async def on_paid(msg: Message, bot: Bot) -> None:
         return
     if product_key == "studio" and paid_uid:
         await _do_studio(msg, paid_uid)
+        return
+    if product and product.get("gift_token"):
+        await _send_gift(msg, product)
         return
     if product:
         await msg.answer(
@@ -1809,7 +1917,7 @@ async def on_photo(msg: Message, bot: Bot) -> None:
     # и кнопки не должны зависеть от нейронки (она может быть на 429).
     metrics = {"face_found": False, "error": "biometry_unavailable"}
     metrics_text = format_metrics(metrics)
-    kb = _card_keyboard()
+    kb = await _card_keyboard_for(msg.from_user.id)
     try:
         photo = msg.photo[-1]  # самое большое разрешение
         tg_file = await bot.get_file(photo.file_id)
