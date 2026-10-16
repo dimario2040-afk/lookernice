@@ -304,7 +304,12 @@ async def _push_battle(r: dict) -> None:
     if _bot is None:
         return
     try:
-        await _bot.send_message(r["chat_id"], battles.result_text(r), parse_mode="HTML")
+        await _bot.send_message(
+            r["chat_id"],
+            battles.result_text(r),
+            parse_mode="HTML",
+            reply_markup=battles.rematch_keyboard(r),
+        )
     except Exception:  # noqa: BLE001 — чат мог удалить бота
         log.exception("battle push failed")
 

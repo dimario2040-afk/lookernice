@@ -52,21 +52,44 @@ async def resolve(battle_id: int, opponent_score: float) -> dict:
 
 
 def result_text(r: dict) -> str:
-    """Жёсткий текст результата батла для чата (тегает обоих)."""
+    """Табло результата батла в духе хоккейного счёта + тегает обоих."""
     c = f'<a href="tg://user?id={r["challenger_id"]}">{r["challenger_name"]}</a>'
     o = f'<a href="tg://user?id={r["opponent_id"]}">{r["opponent_name"]}</a>'
     cs, os_ = r["challenger_score"], r["opponent_score"]
 
+    board = (
+        "┌───────── ⚔️ ─────────┐\n"
+        f"│  {cs:.4f}  │  {os_:.4f}  │\n"
+        "└────────────────────────┘"
+    )
+
     if r["winner_id"] is None:
-        head = f"🤝 <b>НИЧЬЯ</b> — оба на {cs:.4f}. Так себе мог."
+        verdict = f"🤝 <b>НИЧЬЯ</b> — оба на {cs:.4f}. Так себе мог."
     elif r["winner_id"] == r["challenger_id"]:
-        head = f"💀 <b>{c} СМОГНУЛ {o}</b>"
+        verdict = f"👑 <b>ПОБЕДА: {c}</b>"
     else:
-        head = f"💀 <b>{o} СМОГНУЛ {c}</b>"
+        verdict = f"👑 <b>ПОБЕДА: {o}</b>"
 
     return (
-        f"⚔️ МОГ-БАТТЛ #{r['battle_id']}\n"
-            f"{c}: <b>{cs:.4f}</b>  ·  {o}: <b>{os_:.4f}</b>\n\n"
-        f"{head}\n\n"
+        f"🏒 <b>МОГ-БАТТЛ #{r['battle_id']}</b>\n{board}\n"
+        f"{c} — вызывающий · {o} — принимающий\n\n"
+        f"{verdict}\n\n"
         "<i>MOG — игра. Баллы случайны, не оценка внешности.</i>"
     )
+
+
+def rematch_keyboard(r: dict):
+    """Кнопка реванша под результатом батла (ленивый импорт aiogram)."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔁 Реванш!",
+                    callback_data=f"rematch:{r['battle_id']}",
+                )
+            ]
+        ]
+    )
+

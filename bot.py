@@ -597,6 +597,43 @@ async def cmd_mog(msg: Message) -> None:
         )
     await msg.reply(text, reply_markup=kb, parse_mode="HTML")
 
+# ───────────────────────── РЕВАНШ ─────────────────────────
+@dp.callback_query(F.data.startswith("rematch:"))
+async def on_rematch(cb: CallbackQuery) -> None:
+    """🔁 Реванш: проигравший снова вызывает победителя на новый батл."""
+    from game import battles as mog_battles
+    from game import db as mog_db
+
+    battle_id = int((cb.data.split(":", 1)[1]).split(":", 1)[0])
+    battle = await mog_db.get_battle(battle_id)
+    if battle is None:
+        await cb.answer("Бой не найден", show_alert=True)
+        return
+    if battle.get("status") == "pending":
+        await cb.answer("Этот бой ещё не закончен — кинь фото!", show_alert=True)
+        return
+
+    # Реванш вызывает проигравший (при ничьей — принимавший вызывающий).
+    cs = battle["challenger_score"] or 0.0
+    os_ = battle["opponent_score"] or 0.0
+    if cs >= os_:
+        chal = {"id": battle["challenger_id"], "name": battle["challenger_name"]}
+        opp = {"id": battle["opponent_id"], "name": battle["opponent_name"]}
+    else:
+        chal = {"id": battle["opponent_id"], "name": battle["opponent_name"]}
+        opp = {"id": battle["challenger_id"], "name": battle["challenger_name"]}
+
+    new_id = await mog_battles.create(battle["chat_id"], chal, opp)
+    await cb.answer("Реванш!", show_alert=False)
+    await cb.message.reply(
+        f"🔁 <b>РЕВАНШ!</b>\n\n"
+        f"{chal['name']} снова вызывает {opp['name']}! "
+        f"{opp['name']}, кинь своё фото — и табло обновится.",
+        parse_mode="HTML",
+    )
+    log.info("rematch #%s -> battle #%s", battle_id, new_id)
+
+
 # ---------------------------------------------------------------- Stars (оплата)
 @dp.message(Command("buy"))
 async def cmd_buy(msg: Message) -> None:
@@ -868,7 +905,11 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             if pending:
                 duel_score = mog_rolls.roll(raw)["score"]
                 res = await mog_battles.resolve(pending["id"], duel_score)
-                await msg.reply(mog_battles.result_text(res), parse_mode="HTML")
+                await msg.reply(
+                    mog_battles.result_text(res),
+                    parse_mode="HTML",
+                    reply_markup=mog_battles.rematch_keyboard(res),
+                )
         except Exception:  # noqa: BLE001 — батл не должен ронять обычный разбор
             log.exception("battle resolve failed")
 
