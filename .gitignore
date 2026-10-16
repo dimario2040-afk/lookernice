@@ -17,3 +17,8 @@ bot.out.log
 .codegraph/
 .venv/
 venv/
+
+# archives / junk (user's local backups, never commit)
+*.rar
+*.zip
+*.db
