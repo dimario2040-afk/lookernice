@@ -1,0 +1,42 @@
+# MOG keep-alive + optional Render deploy trigger.
+#
+# Зачем: бесплатный Render «засыпает» после ~15 мин без ВХОДЯЩИХ запросов.
+# Внутренний self-ping бота (600с) уже держит его, но этот workflow — страховка:
+# он пингует сервис извне каждые 14 минут, поэтому сервис не спит даже между
+# рестартами. Никаких аккаунтов/токенов не нужно (публичный GET).
+#
+# Опционально: если задать секрет репозитория RENDER_DEPLOY_HOOK (Settings →
+# Secrets and variables → Actions), workflow дополнительно триггерит деплой
+# последнего коммита на Render — это чинит «stale deploy» одной кнопкой.
+name: keepalive
+
+on:
+  schedule:
+    # каждые 14 минут (Render засыпает на 15-й) — безопасно ниже порога
+    - cron: "*/14 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render (anti-sleep)
+        run: |
+          set -euo pipefail
+          BASE="https://lookernice-bot.onrender.com"
+          # /healthz после свежего деплоя; / — всегда есть (даже на старом деплое).
+          # ЛЮБОЙ HTTP-ответ = входящий трафик => сервис не спит.
+          for path in /healthz /; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 "$BASE$path" || echo "000")
+            echo "GET $path -> $code"
+          done
+
+      - name: Trigger Render deploy (optional)
+        # Сработает только если в репозитории задан секрет RENDER_DEPLOY_HOOK.
+        if: ${{ secrets.RENDER_DEPLOY_HOOK != '' }}
+        run: |
+          echo "Triggering Render deploy via hook…"
+          curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}" || true
