@@ -158,3 +158,94 @@ def rematch_keyboard(arena_id: int):
             ]
         ]
     )
+
+
+# ------------------------------------------------------------------ плей-офф
+def _seed_positions(n: int) -> list[int]:
+    """Стандартная расстановка сеяных в сетке размера n (степень 2)."""
+    pos = [1]
+    while len(pos) < n:
+        m = len(pos) * 2
+        nxt: list[int] = []
+        for p in pos:
+            nxt.append(p)
+            nxt.append(m + 1 - p)
+        pos = nxt
+    return pos
+
+
+def bracket(players: list[dict]) -> dict:
+    """Single-elim сетка от лучшего сеяного. Победа — по score (детерминированно).
+
+    Возвращает {"rounds": [[(a, b, winner), ...], ...], "champion": player|None}.
+    Игроки с одинаковым score — побеждает тот, кто выше в сеянии (стабильность).
+    """
+    seeds = sorted(players, key=lambda p: p["score"], reverse=True)
+    if not seeds:
+        return {"rounds": [], "champion": None}
+    if len(seeds) == 1:
+        return {"rounds": [], "champion": seeds[0]}
+
+    n = 1
+    while n < len(seeds):
+        n *= 2
+    field: list[dict | None] = [
+        seeds[pos - 1] if pos <= len(seeds) else None for pos in _seed_positions(n)
+    ]
+
+    rounds: list[list[tuple]] = []
+    while len(field) > 1:
+        matches: list[tuple] = []
+        nxt: list[dict | None] = []
+        for i in range(0, len(field), 2):
+            a, b = field[i], field[i + 1]
+            if a is None and b is None:
+                nxt.append(None)
+                matches.append((None, None, None))
+            elif a is None:
+                nxt.append(b)
+                matches.append((None, b, b))
+            elif b is None:
+                nxt.append(a)
+                matches.append((a, None, a))
+            else:
+                win = a if a["score"] >= b["score"] else b
+                nxt.append(win)
+                matches.append((a, b, win))
+        rounds.append(matches)
+        field = nxt
+
+    return {"rounds": rounds, "champion": field[0]}
+
+
+def bracket_text(arena: dict, players: list[dict]) -> str:
+    """Текстовая сетка плей-офф (для сообщения под табло)."""
+    br = bracket(players)
+    rounds = br.get("rounds") or []
+    if not rounds:
+        return ""
+    out = [f"🏆 <b>МОГ-АРЕНА #{arena['id']} — СЕТКА</b>", ""]
+    total = len(rounds)
+    for ri, matches in enumerate(rounds):
+        title = "ФИНАЛ" if ri == total - 1 else f"Раунд {ri + 1}"
+        out.append(f"<b>{title}</b>")
+        for a, b, w in matches:
+            if a is None and b is None:
+                continue
+            if a is None:
+                out.append(f"  ▫️ бай · <b>{_esc(b['name'])}</b>")
+            elif b is None:
+                out.append(f"  ▫️ бай · <b>{_esc(a['name'])}</b>")
+            else:
+                out.append(
+                    f"  {_esc(a['name'])} {a['score']:.2f} — "
+                    f"{_esc(b['name'])} {b['score']:.2f}"
+                    f" → <b>{_esc(w['name'])}</b> ★"
+                )
+        out.append("")
+    ch = br.get("champion")
+    if ch:
+        out.append(
+            f"👑 <b>Чемпион: {_esc(ch['name'])}</b> · {ch['score']:.4f} ({ch['tier']})"
+        )
+    return "\n".join(out)

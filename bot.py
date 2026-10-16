@@ -1101,7 +1101,7 @@ async def _arena_render_lobby(message, arena_id: int) -> None:
 
 
 async def _arena_finish(message, arena_id: int) -> None:
-    """Резолвит арену и публикует финальное табло."""
+    """Резолвит арену: публикует сетку плей-офф + неоновое табло-картинку."""
     from game import arena as mog_arena
     from game import db as mog_db
 
@@ -1110,11 +1110,27 @@ async def _arena_finish(message, arena_id: int) -> None:
         return
     plist = await mog_arena.resolve(arena_id)
     text = mog_arena.result_text(arena, plist)
+    btext = mog_arena.bracket_text(arena, plist)
     kb = mog_arena.rematch_keyboard(arena_id)
+    shown = btext or text
     try:
-        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await message.edit_text(shown, reply_markup=kb, parse_mode="HTML")
     except Exception:  # noqa: BLE001
-        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await message.answer(shown, reply_markup=kb, parse_mode="HTML")
+    try:
+        pic = await asyncio.to_thread(_arena_board_image, plist)
+    except Exception:  # noqa: BLE001
+        pic = None
+        log.exception("arena board image failed")
+    if pic:
+        try:
+            await message.answer_photo(
+                BufferedInputFile(pic, filename="mog_arena.jpg"),
+                caption=text,
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("arena board send failed")
 
 
 @dp.message(Command("arena", "арена"))
@@ -1729,6 +1745,78 @@ def _studio_photo(photo_bytes: bytes, score: float, tier: str) -> bytes:
     y0 = h - frame - th - pad * 3
     draw.rectangle([x0, y0, x0 + tw + pad * 2, y0 + th + pad * 2], fill=(0, 0, 0))
     draw.text((x0 + pad, y0 + pad), label, font=f, fill=gold_light)
+
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    return out.getvalue()
+
+
+def _arena_board_image(players: list[dict]) -> bytes | None:
+    """Неоновое табло арены: ранкинг по score (JPEG bytes | None)."""
+    if not players:
+        return None
+    import io
+
+    from PIL import Image, ImageDraw
+
+    ranked = sorted(players, key=lambda p: p["score"], reverse=True)
+    W = 1000
+    top_pad, row_h, bot_pad = 132, 66, 36
+    H = top_pad + row_h * len(ranked) + bot_pad
+    img = Image.new("RGB", (W, H), (13, 13, 24))
+    draw = ImageDraw.Draw(img)
+
+    for x in range(0, W, 40):
+        draw.line([(x, 0), (x, H)], fill=(22, 22, 38), width=1)
+    for y in range(0, H, 40):
+        draw.line([(0, y), (W, y)], fill=(22, 22, 38), width=1)
+
+    neon = [(80, 220, 255), (255, 90, 200), (120, 255, 160)]
+    gold = (255, 214, 90)
+
+    f_title = _load_font(46)
+    f_rank = _load_font(34)
+    f_name = _load_font(30)
+    f_score = _load_font(34)
+    f_tier = _load_font(20)
+
+    draw.text((40, 30), "MOG ARENA", font=f_title, fill=(255, 255, 255))
+    draw.text((44, 90), "itogovoe tablo / final ranking", font=f_tier, fill=(150, 150, 175))
+
+    maxs = max((p["score"] for p in ranked), default=1.0) or 1.0
+    for i, p in enumerate(ranked):
+        y = top_pad + i * row_h
+        col = gold if i == 0 else neon[i % len(neon)]
+        draw.rectangle([40, y, 86, y + 46], fill=col)
+        rk = "★" if i == 0 else str(i + 1)
+        try:
+            rb = draw.textbbox((0, 0), rk, font=f_rank)
+            draw.text(
+                (40 + 23 - (rb[2] - rb[0]) / 2, y + 23 - (rb[3] - rb[1]) / 2 - rb[1]),
+                rk,
+                font=f_rank,
+                fill=(10, 10, 18),
+            )
+        except Exception:  # noqa: BLE001
+            draw.text((48, y + 6), rk, font=f_rank, fill=(10, 10, 18))
+
+        name = (p.get("name") or "?")[:22]
+        draw.text((110, y + 2), name, font=f_name, fill=(240, 240, 255))
+        draw.text((110, y + 36), str(p.get("tier") or ""), font=f_tier, fill=(150, 150, 175))
+
+        sc = f"{p['score']:.4f}"
+        try:
+            sw = draw.textbbox((0, 0), sc, font=f_score)[2]
+        except Exception:  # noqa: BLE001
+            sw = len(sc) * 20
+        draw.text((W - 40 - sw, y + 6), sc, font=f_score, fill=col)
+
+        bar_x0, bar_x1, bar_y = 110, W - 60, y + 58
+        frac = max(0.0, min(1.0, p["score"] / maxs))
+        draw.rectangle([bar_x0, bar_y, bar_x1, bar_y + 4], fill=(35, 35, 55))
+        draw.rectangle(
+            [bar_x0, bar_y, bar_x0 + int((bar_x1 - bar_x0) * frac), bar_y + 4], fill=col
+        )
 
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=90)
