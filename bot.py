@@ -813,6 +813,7 @@ def _card_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🏆 Общий баттл", callback_data="arena_quick"),
             ],
             [InlineKeyboardButton(text="🔄 Ещё раз — 15 ⭐", callback_data="reroll")],
+            [InlineKeyboardButton(text="🎨 Студия (ретушь) — 35 ⭐", callback_data="studio")],
             [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
             [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
             [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
@@ -1278,6 +1279,51 @@ async def _do_reroll(msg: Message, user_id: int) -> None:
         await msg.answer(f"🔄 Реролл: было {prev:.4f} → стало {score:.4f} ({tier})")
 
 
+# ------------------------------------------------------- ванити-Студия (35 ⭐)
+@dp.callback_query(F.data == "studio")
+async def on_studio(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка под карточкой: платная ванити-ретушь ТОГО ЖЕ фото (байты из памяти)."""
+    from game import payments
+
+    if cb.from_user.id not in _pending_full:
+        await cb.answer("📸 Фото уже вышло из памяти — кинь его заново.", show_alert=True)
+        return
+    try:
+        await payments.send_invoice(bot, cb.message.chat.id, "studio", cb.from_user.id)
+        await cb.answer("Счёт на Студию отправлен ⭐")
+    except Exception:  # noqa: BLE001
+        log.exception("studio invoice failed")
+        await cb.answer(PUBLIC_ERROR, show_alert=True)
+
+
+async def _do_studio(msg: Message, user_id: int) -> None:
+    """После оплаты: отдать отретушированную карточку (балл не меняется)."""
+    data = _pending_full.get(user_id)
+    if not data:
+        await msg.answer(
+            "🎨 Оплачено, но фото уже вышло из памяти. Кинь заново — ретушь бесплатная.",
+            parse_mode="HTML",
+        )
+        return
+    raw = data[0]
+    score, tier = _mog_score_tier(raw)
+    try:
+        card = await asyncio.to_thread(_studio_photo, raw, score, tier)
+        await msg.answer_photo(
+            BufferedInputFile(card, filename="mog_studio.jpg"),
+            caption=(
+                f"🎨 <b>MOG STUDIO · {score:.4f} · {tier}</b>\n"
+                "Ретушь + золотая рамка. Чистая ванити — балл не менялся.\n\n"
+                + _legal_micro()
+            ),
+            parse_mode="HTML",
+            reply_markup=_card_keyboard(),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("studio card failed")
+        await msg.answer("🎨 Не смог обработать — попробуй ещё раз.")
+
+
 @dp.pre_checkout_query()
 async def on_pre_checkout(q: PreCheckoutQuery, bot: Bot) -> None:
     from game import payments
@@ -1295,6 +1341,9 @@ async def on_paid(msg: Message, bot: Bot) -> None:
     product_key, paid_uid, _extras = payments.parse_payload(sp.invoice_payload)
     if product_key == "reroll" and paid_uid:
         await _do_reroll(msg, paid_uid)
+        return
+    if product_key == "studio" and paid_uid:
+        await _do_studio(msg, paid_uid)
         return
     if product:
         await msg.answer(
@@ -1532,6 +1581,50 @@ def _load_font(size: int):
         return ImageFont.load_default(size)
     except Exception:  # noqa: BLE001
         return ImageFont.load_default()
+
+
+def _studio_photo(photo_bytes: bytes, score: float, tier: str) -> bytes:
+    """Ванити-ретушь карточки: мягкое сглаживание + тёплый тон + золотая рамка
+    + бейдж «MOG STUDIO». Балл/тир НЕ меняются — это чистая косметика."""
+    import io
+
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+
+    base = Image.open(io.BytesIO(_mog_stamp(photo_bytes, score, tier))).convert("RGB")
+    # мягкое «ретушное» сглаживание (blend с блюром ≈ лёгкое билатеральное)
+    smooth = base.filter(ImageFilter.GaussianBlur(1.2))
+    img = Image.blend(base, smooth, 0.35)
+    img = ImageEnhance.Color(img).enhance(1.08)
+    img = ImageEnhance.Contrast(img).enhance(1.06)
+    img = ImageEnhance.Brightness(img).enhance(1.03)
+
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    gold, gold_light = (212, 175, 55), (255, 230, 140)
+    frame = max(8, int(min(w, h) * 0.02))
+    draw.rectangle([0, 0, w - 1, h - 1], outline=gold, width=frame)
+    draw.rectangle(
+        [frame, frame, w - 1 - frame, h - 1 - frame],
+        outline=gold_light,
+        width=max(2, frame // 3),
+    )
+
+    f = _load_font(max(16, int(w * 0.045)))
+    label = "★ MOG STUDIO ★"
+    try:
+        tb = draw.textbbox((0, 0), label, font=f)
+        tw, th = tb[2] - tb[0], tb[3] - tb[1]
+    except Exception:  # noqa: BLE001
+        tw, th = len(label) * 12, 22
+    pad = max(8, int(w * 0.012))
+    x0 = frame + pad
+    y0 = h - frame - th - pad * 3
+    draw.rectangle([x0, y0, x0 + tw + pad * 2, y0 + th + pad * 2], fill=(0, 0, 0))
+    draw.text((x0 + pad, y0 + pad), label, font=f, fill=gold_light)
+
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    return out.getvalue()
 
 
 def _mog_stamp(photo_bytes: bytes, score: float, tier: str) -> bytes:
