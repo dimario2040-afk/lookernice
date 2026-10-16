@@ -931,6 +931,20 @@ _SPOT_IDX = {
 }
 
 
+# Сила неон-скана: 1.0 — как в оригинале; 0.10 — на 90% слабее.
+# Меняется без правки кода: MOG_SPOT_OPACITY=0.05 в .env.
+SPOT_OPACITY = float(os.getenv("MOG_SPOT_OPACITY", "0.10"))
+
+
+def _fade(img, factor: float):
+    """Ослабляет RGBA-слой в factor раз (по альфе). factor>=1 — без изменений."""
+    if factor >= 1.0:
+        return img
+    out = img.copy()
+    out.putalpha(img.getchannel("A").point(lambda v: int(v * factor)))
+    return out
+
+
 def _neon_color(score: int) -> tuple[int, int, int]:
     if score < 40:
         return (255, 45, 94)    # неон-красный — слабое место
@@ -1033,7 +1047,10 @@ def annotate_weakspots(image_bytes: bytes, stats: dict) -> tuple[bytes, list]:
 
     glow = overlay.filter(ImageFilter.GaussianBlur(6))
     base = img.convert("RGBA")
-    out = Image.alpha_composite(Image.alpha_composite(base, glow), overlay)
+    out = Image.alpha_composite(
+        Image.alpha_composite(base, _fade(glow, SPOT_OPACITY)),
+        _fade(overlay, SPOT_OPACITY),
+    )
     if out.width > 1080:
         ratio = 1080 / out.width
         out = out.resize((1080, int(out.height * ratio)))
