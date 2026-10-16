@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import time
 import uuid
 
@@ -87,7 +88,14 @@ def _decode_b64(raw: str) -> bytes | None:
 
 
 async def h_health(_request: web.Request) -> web.Response:
-    return _json({"ok": True, "service": "mog"})
+    return _json(
+        {
+            "ok": True,
+            "service": "mog",
+            "version": config.APP_VERSION,
+            "provider": os.getenv("MODEL_NAME", "zhipu"),
+        }
+    )
 
 
 async def h_me(request: web.Request) -> web.Response:

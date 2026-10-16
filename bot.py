@@ -39,6 +39,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from game.config import PUBLIC_ERROR  # noqa: E402  (после load_dotenv — конфиг читает ENV)
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 MODEL_API_KEY = os.getenv("MODEL_API_KEY", "")
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
@@ -295,11 +297,112 @@ lower third, bigonial width, zygos, anti-fraud (ракурс/свет), softmaxx
 """
 
 # ---------------------------------------------------------------- мозги (VLM)
+# ─────────────────── ПРОВАЙДЕРЫ VLM (заменяемые) ───────────────────
+# Список провайдеров с их env-именами. Любой можно заменить/добавить, не трогая код.
+# Формат: (label, base_url_env, key_env, models_csv). Поддерживает несколько моделей.
+_VLM_PROVIDERS = [
+    # Уже legacy: MODEL_BASE_URL имеет дефолт, MODEL_API_KEY берётся из .env,
+    # MODEL_NAME с дефолтом. Поэтому ключи жёстко НЕ пустые — target всегда есть.
+    ("zhipu", None, "MODEL_API_KEY", None),  # None => подставить MODEL_NAME
+]
+
+
+def _vlm_key_env(label: str) -> str:
+    """label провайдера -> имя env с его API-ключом."""
+    for lbl, _url, key_env, _models in _VLM_PROVIDERS:
+        if lbl == label:
+            return key_env
+    return "MODEL_API_KEY"
+
+
+def _vlm_targets() -> list[tuple[str, str, str]]:
+    """Собирает (label, base_url, model) по всем провайдерам с непустыми ключами.
+
+    У каждого провайдера свой env с ключом и URL (можно разделить, если несколько).
+    Поддерживается MODEL_FALLBACKS — дописывается как дополнительные цели.
+    """
+    targets: list[tuple[str, str, str]] = []
+
+    # legacy-путь: основной провайдер на MODEL_API_KEY + MODEL_BASE_URL + MODEL_NAME.
+    if MODEL_API_KEY and MODEL_BASE_URL:
+        targets.append(("zhipu", MODEL_BASE_URL, MODEL_NAME))
+
+    # доп. провайдеры: формат "label|url_env|key_env|models,через,запятую"
+    for label, url_env, key_env, models_csv in _VLM_PROVIDERS:
+        if key_env is None:
+            continue
+        key = os.getenv(key_env, "").strip()
+        base = os.getenv(url_env, "", "").strip() if url_env else ""
+        if not key or not base:
+            continue
+        for model in (m.strip() for m in models_csv.split(",")):
+            if model:
+                targets.append((label, base, model))
+
+    # явный MODEL_FALLBACKS (на других провайдерах — просто список моделей)
+    if targets:
+        base = targets[0][1]
+        for model in MODEL_FALLBACKS:
+            if model and model not in (t[2] for t in targets):
+                targets.append(("zhipu", base, model))
+
+    return targets
+
+
+_GARBAGE_MARKERS = (
+    "<?php", "<!doctype", "<html", "</html", "```json", "```python",
+    "\ufffd", "�",
+)
+
+
+def _sanitize_roast(text: str) -> str:
+    """Чистит ответ VLM: режет HTML/markdown-заборы и битые символы.
+
+    НЕ трогает обычные слова — только явный мусор (теги, U+FFFD, fences).
+    """
+    import re
+    import unicodedata
+
+    if not text:
+        return ""
+    # битые символы (U+FFFD)
+    text = text.replace("\ufffd", "").replace("�", "")
+    # HTML-теги кроме наших <b>/<i>
+    text = re.sub(r"<(?!/?[bi]>)[^>]+>", "", text, flags=re.IGNORECASE)
+    # markdown-заборы и json-блоки
+    text = re.sub(r"```[a-zA-Z0-9_+-]*", "", text)
+    # служебные маркеры провайдера
+    for marker in _GARBAGE_MARKERS:
+        text = text.replace(marker, "")
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def _extract_roast(resp, fallback_hint: str = "") -> str:
+    """Достаёт текст из ответа VLM и прогоняет через санитайзер + детектор мусора."""
+    finish = ""
+    try:
+        text = (resp.choices[0].message.content or "").strip()
+        finish = resp.choices[0].finish_reason or ""
+    except Exception:  # noqa: BLE001
+        text = ""
+    text = _sanitize_roast(text)
+    log.info("roast: finish=%s chars=%d", finish, len(text))
+    # если после чистки ничего осмысленного не осталось — fallback
+    if len(text) < 25:
+        return (
+            f"⚠️ Нейронка сегодня стесняется (finish_reason={finish or 'unknown'}). "
+            "Попробуй другое фото: прямой ракурс, дневной свет, без очков."
+        )
+    return text
+
+
 def _vision_chat(messages: list, *, max_tokens: int, temperature: float = 0.9):
-    """Вызов VLM с авто-фолбэком по free-моделям и ретраями на 429/5xx.
+    """Вызов VLM с авто-фолбэком по провайдерам и ретраями на 429/5xx.
 
     z.ai free-модели периодически отвечают 429 (code 1305, «перегружено») —
-    short retry + переход к следующей модели, чтобы юзер получал ответ.
+    short retry + переход к следующему провайдеру/модели, чтобы юзер получал ответ.
     """
     import time
 
@@ -311,10 +414,14 @@ def _vision_chat(messages: list, *, max_tokens: int, temperature: float = 0.9):
         RateLimitError,
     )
 
-    client = OpenAI(api_key=MODEL_API_KEY, base_url=MODEL_BASE_URL)
+    targets = _vlm_targets()
+    if not targets:
+        raise RuntimeError("NO_VLM_PROVIDER: не задано ни одного VLM-провайдера (нужны MODEL_API_KEY/MODEL_BASE_URL)")
+
     last_exc: Exception | None = None
-    busy = True  # если всё упало только на 429 — это перегрузка, а не наш баг
-    for model in MODEL_CANDIDATES:
+    busy = True  # если всё упало только на 429/сеть — это внешняя перегрузка, не наш баг
+    for label, base_url, model in targets:
+        client = OpenAI(api_key=os.getenv(_vlm_key_env(label), ""), base_url=base_url)
         for attempt in range(3):
             try:
                 return client.chat.completions.create(
@@ -326,22 +433,22 @@ def _vision_chat(messages: list, *, max_tokens: int, temperature: float = 0.9):
             except (RateLimitError, APIConnectionError, APITimeoutError) as exc:
                 last_exc = exc
                 busy = True
-                log.warning("model %s try %d: %s", model, attempt + 1, str(exc)[:120])
+                log.warning("[%s] %s try %d: %s", label, model, attempt + 1, str(exc)[:110])
                 time.sleep(min(6.0, 1.5 * (attempt + 1)))
             except APIStatusError as exc:
                 last_exc = exc
                 if getattr(exc, "status_code", 0) >= 500:
                     busy = True
-                    log.warning("model %s 5xx try %d: %s", model, attempt + 1, str(exc)[:120])
+                    log.warning("[%s] %s 5xx try %d: %s", label, model, attempt + 1, str(exc)[:110])
                     time.sleep(1.5 * (attempt + 1))
                 else:
                     busy = False
-                    log.warning("model %s %s: %s", model, exc.status_code, str(exc)[:120])
-                    break  # 4xx кроме 429 — сразу к следующей модели
+                    log.warning("[%s] %s %s: %s", label, model, exc.status_code, str(exc)[:110])
+                    break  # 4xx кроме 429 — сразу к след. провайдеру/модели
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 busy = False
-                log.warning("model %s err: %s", model, str(exc)[:120])
+                log.warning("[%s] %s err: %s", label, model, str(exc)[:110])
                 break
     if busy:
         raise RuntimeError("MODEL_BUSY: бесплатная vision-модель перегружена (429/1305)")
@@ -358,7 +465,7 @@ def _friendly_error(exc: Exception) -> str:
             "🧠 Нейронка сейчас перегружена (бесплатная модель). "
             "Кинь фото через минуту — вернётся. Скан «Слабые места» работает всегда."
         )
-    return f"💥 Упал с ошибкой: {exc}"
+    return f"💥 {PUBLIC_ERROR}"
 
 
 # Провайдер-агностик: любой OpenAI-совместимый endpoint с vision-моделью.
@@ -389,19 +496,7 @@ def analyze_with_vlm(photo_bytes: bytes, metrics_text: str) -> str:
     # 4096: reasoning-модели (GLM-4.6v) тратят токены на размышления,
     # при 2048 ответ обрывался на полуслове (finish_reason=length).
     resp = _vision_chat(messages, max_tokens=4096)
-    finish = ""
-    try:
-        text = (resp.choices[0].message.content or "").strip()
-        finish = resp.choices[0].finish_reason or ""
-    except Exception:  # noqa: BLE001 — кривой/пустой ответ провайдера
-        text = ""
-    log.info("full: finish=%s chars=%d", finish, len(text))
-    if not text:
-        text = (
-            f"⚠️ Нейронка отфильтровала ответ (finish_reason={finish}). "
-            "Попробуй другое фото: прямой ракурс, дневной свет, без очков."
-        )
-    return text
+    return _extract_roast(resp)
 
 
 # ---------------------------------------------------------------- простой слой
@@ -501,13 +596,22 @@ def analyze_simple(photo_bytes: bytes, metrics_text: str) -> str:
                 raise
         else:
             raise
-    text, finish = _extract_text(resp)
-    log.info("simple: finish=%s chars=%d", finish, len(text))
+    text = _extract_roast(resp)
     return text
 
 
 # Контекст для кнопки "подробный разбор": user_id -> (photo_bytes, metrics_text).
+# Ограничен PENDING_LIMIT, чтобы бот не съедал RAM у коммерческого инстанса.
 _pending_full: dict[int, tuple[bytes, str]] = {}
+
+
+def _remember_photo(user_id: int, raw: bytes, metrics_text: str) -> None:
+    from game import config as mog_config
+
+    _pending_full[user_id] = (raw, metrics_text)
+    if len(_pending_full) > mog_config.PENDING_LIMIT:
+        for old in list(_pending_full.keys())[: len(_pending_full) - mog_config.PENDING_LIMIT]:
+            _pending_full.pop(old, None)
 
 # ---------------------------------------------------------------- бот
 dp = Dispatcher()
@@ -568,7 +672,7 @@ async def cmd_mog(msg: Message) -> None:
         battle_id = await mog_battles.create(msg.chat.id, challenger, opponent)
     except Exception as exc:  # noqa: BLE001 — БД может быть не инициализирована
         log.exception("battle create failed")
-        await msg.reply(f"💥 Не смог создать батл: {exc}")
+        await msg.reply(f"💥 {PUBLIC_ERROR}")
         return
 
     text = (
@@ -666,7 +770,7 @@ async def on_buy(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer("Счёт отправлен ⭐")
     except Exception as exc:  # noqa: BLE001
         log.exception("send_invoice failed")
-        await cb.answer(f"Не смог выставить счёт: {exc}", show_alert=True)
+        await cb.answer(PUBLIC_ERROR, show_alert=True)
 
 
 @dp.pre_checkout_query()
@@ -933,7 +1037,7 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         simple = await asyncio.to_thread(analyze_simple, raw, metrics_text)
 
         # Запоминаем контекст для кнопки "подробный разбор"
-        _pending_full[msg.from_user.id] = (raw, metrics_text)
+        _remember_photo(msg.from_user.id, raw, metrics_text)
 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1029,7 +1133,7 @@ async def on_weakspots(cb: CallbackQuery, bot: Bot) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("weakspots failed")
-        await cb.message.answer(f"💥 Не смог нарисовать скан: {exc}")
+        await cb.message.answer(f"💥 {PUBLIC_ERROR}")
 
 
 @dp.callback_query(F.data == "metrics")
@@ -1108,7 +1212,15 @@ async def main() -> None:
             )
             log.info("webhook установлен: %s%s", PUBLIC_BASE_URL, hook_path)
         except Exception:  # noqa: BLE001
-            log.exception("set_webhook не удался — апдейты не придут, но health-check жив")
+            # Страховка: лучше polling, чем бот, который молчит. Порт уже занят,
+            # поэтому / и /app продолжают работать (health-check и мини-апп живы).
+            log.exception("set_webhook не удался — переключаюсь на polling, TG не замолчит")
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception:  # noqa: BLE001, S110
+                pass
+            await dp.start_polling(bot)
+            return
 
         # Кнопка-меню "открыть MOG" во всех чатах.
         try:

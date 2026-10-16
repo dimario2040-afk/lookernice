@@ -2,12 +2,23 @@
 import os
 from pathlib import Path
 
+# ─── Коммерческая надёжность: заменяемые компоненты через ENV ───
+# Версия сборки — видна в /api/health, чтобы проверять, какой коммит задеплоен.
+APP_VERSION = os.getenv("APP_VERSION", "2026-10-16.4")
+
+# Вместо сырых {exc} наружу — только этот текст (приватность + коммерч. тайна).
+PUBLIC_ERROR = "Что-то пошло не так. Попробуй ещё разок 🙃"
+
+# Сколько последних фото держим в оперативке для кнопок (слабые места/замеры).
+PENDING_LIMIT = int(os.getenv("MOG_PENDING_LIMIT", "200"))
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Токен бота (нужен для проверки WebApp initData). Совпадает с TELEGRAM_TOKEN бота.
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 
-# SQLite база игры (создаётся сама).
+# SQLite база игры (создаётся сама). Путь переопределяется ENV — на проде
+# подставляем постоянный диск, чтобы данные не исчезали при редеплое.
 DB_PATH = os.getenv("MOG_DB_PATH", str(BASE_DIR / "mog.db"))
 
 # Папка со статикой мини-аппа.
