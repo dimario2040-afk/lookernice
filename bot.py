@@ -304,30 +304,50 @@ lower third, bigonial width, zygos, anti-fraud (ракурс/свет), softmaxx
 # Формат: (label, base_url, key_env, models_csv)
 #   base_url — готовый URL (с "://") ИЛИ имя ENV-переменной с URL.
 # Если ключа провайдера нет — он тихо пропускается (включается позже без правок кода).
+def _vlm_env(name: str, default: str) -> str:
+    """Значение из env (после load_dotenv) или дефолт — всё настраивается файлами."""
+    return (os.getenv(name) or default).strip()
+
+
 _VLM_PROVIDERS = [
-    # 1) Google AI Studio — бесплатный тир, лучшая бесплатная vision, без карты.
-    #    ВАЖНО: Google блокирует API по региону — из РФ не работает, но на Render
-    #    (Frankfurt) доступен. Недоступный регион авто-выключаем (см. _VLM_DISABLED).
+    # 1) Google AI Studio (ключ GEMINI_API_KEY). Регион РФ блокируется — работает на
+    #    Render (Frankfurt). Недоступный регион авто-выключаем (см. _VLM_DISABLED).
     (
         "gemini",
-        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        _vlm_env("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
         "GEMINI_API_KEY",
-        "gemini-3.8-flash,gemini-flash-latest",
+        _vlm_env("GEMINI_MODELS", "gemini-3.8-flash,gemini-flash-latest"),
     ),
-    # 2) z.ai / Zhipu — уже настроен (MODEL_API_KEY). glm-4.6v-flash — единственная
-    #    бесплатная vision, часто 429 → запрос уходит дальше по водопаду.
+    # 2) Groq (ключ GROQ_API_KEY) — быстрый, бесплатный тир, vision Llama 4 Scout.
+    (
+        "groq",
+        _vlm_env("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+        "GROQ_API_KEY",
+        _vlm_env("GROQ_MODELS", "qwen/qwen3.8-27b"),
+    ),
+    # 3) AIHubMix (ключ AIHUBMIX_API_KEY) — агрегатор, OpenAI-совместимый, vision.
+    (
+        "aihubmix",
+        _vlm_env("AIHUBMIX_BASE_URL", "https://aihubmix.com/v1"),
+        "AIHUBMIX_API_KEY",
+        _vlm_env("AIHUBMIX_MODELS", "gpt-4o-mini"),
+    ),
+    # 4) z.ai / Zhipu (ключ MODEL_API_KEY) — уже настроен, glm-4.6v-flash, часто 429.
     (
         "zhipu",
         MODEL_BASE_URL,
         "MODEL_API_KEY",
         ",".join(dict.fromkeys([MODEL_NAME] + MODEL_FALLBACKS)),
     ),
-    # 3) OpenRouter — один ключ, пачка бесплатных vision-моделей, без карты.
+    # 5) OpenRouter (ключ OPENROUTER_API_KEY) — один ключ, пачка бесплатных vision.
     (
         "openrouter",
-        "https://openrouter.ai/api/v1",
+        _vlm_env("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         "OPENROUTER_API_KEY",
-        "google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,thinkingmachines/inkling:free",
+        _vlm_env(
+            "OPENROUTER_MODELS",
+            "google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,thinkingmachines/inkling:free",
+        ),
     ),
 ]
 
