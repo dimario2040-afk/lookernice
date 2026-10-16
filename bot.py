@@ -710,17 +710,20 @@ dp = Dispatcher()
 
 
 @dp.message(Command("start"))
-async def cmd_start(msg: Message) -> None:
-    await msg.answer(
+async def cmd_start(msg: Message, bot: Bot) -> None:
+    welcome = (
         "💀 <b>PSL-бот на связи.</b>\n\n"
         "Кидай своё фото (лицо крупно, без очков и фильтров) — "
         "сначала скажу по-человечески, без занудства. "
         "А если хочешь жести — жми кнопку «📊 Подробный разбор»: "
         "там PSL-рейтинг, кости, failo/halo и план прокачки.\n\n"
         "Фото обрабатывается локально (MediaPipe) + нейронка. "
-        "Ничего не храню — файл удаляется сразу после анализа.",
-        parse_mode="HTML",
+        "Ничего не храню — файл удаляется сразу после анализа."
     )
+    # 🔞 Согласие на обработку ПДн спрашиваем ОДИН РАЗ — при запуске бота.
+    if not await _ensure_consent(msg, bot, intro=welcome + "\n\n"):
+        return
+    await msg.answer(welcome, parse_mode="HTML")
 
 
 @dp.message(Command("help"))
@@ -1543,7 +1546,7 @@ async def cmd_legal(msg: Message) -> None:
     )
 
 
-async def _ensure_consent(msg: Message, bot: Bot) -> bool:
+async def _ensure_consent(msg: Message, bot: Bot, intro: str = "") -> bool:
     """Согласие на обработку ПДн (152-ФЗ). Нет/устарело → шлёт запрос и False."""
     from game import db as mog_db
     from game import legal as mog_legal
@@ -1567,7 +1570,8 @@ async def _ensure_consent(msg: Message, bot: Bot) -> bool:
         ]
     )
     await msg.answer(
-        "🔞 <b>Прежде чем считать тебя — нужно согласие</b>\n\n"
+        intro
+        + "🔞 <b>Прежде чем считать тебя — нужно согласие</b>\n\n"
         + mog_legal.consent_short()
         + link,
         reply_markup=kb,
