@@ -256,6 +256,24 @@ def format_metrics(m: dict) -> str:
         lines.append(f"асимметрия={m['asymmetry_pct']}% (меньше = лучше)")
     return "; ".join(lines) if lines else "метрики не посчитались"
 
+
+def format_metrics_ui(m: dict) -> str:
+    """Компактные тех-замеры для кнопки (≈×2 короче полной строки), с комментами."""
+    if m.get("error") == "biometry_unavailable":
+        return "биометрия недоступна (лайт-режим хостинга)"
+    if not m.get("face_found"):
+        return "лицо не найдено"
+    rows = []
+    if m.get("fWHR") is not None:
+        rows.append(f"fWHR <b>{m['fWHR']}</b> · норм 1.8–2.0")
+    if m.get("jaw_to_zygo") is not None:
+        rows.append(f"челюсть/скулы <b>{m['jaw_to_zygo']}</b> · ≥0.9")
+    if m.get("canthal_tilt_avg") is not None:
+        rows.append(f"кантальн. <b>{m['canthal_tilt_avg']}°</b> · +hunter/−prey")
+    if m.get("asymmetry_pct") is not None:
+        rows.append(f"асимметрия <b>{m['asymmetry_pct']}%</b> · меньше=лучше")
+    return "\n".join(rows) if rows else "метрики не посчитались"
+
 # ---------------------------------------------------------------- промпт
 SYSTEM_PROMPT = """Ты — эксперт по эстетической медицине и мужской привлекательности:
 антропометрист, знаток looksmaxxing-культуры
@@ -673,15 +691,15 @@ def analyze_simple(photo_bytes: bytes, metrics_text: str) -> str:
     return text
 
 
-# Контекст для кнопки "подробный разбор": user_id -> (photo_bytes, metrics_text).
+# Контекст для кнопок: user_id -> (photo_bytes, metrics_text, metrics_dict).
 # Ограничен PENDING_LIMIT, чтобы бот не съедал RAM у коммерческого инстанса.
-_pending_full: dict[int, tuple[bytes, str]] = {}
+_pending_full: dict[int, tuple[bytes, str, dict]] = {}
 
 
-def _remember_photo(user_id: int, raw: bytes, metrics_text: str) -> None:
+def _remember_photo(user_id: int, raw: bytes, metrics_text: str, metrics: dict) -> None:
     from game import config as mog_config
 
-    _pending_full[user_id] = (raw, metrics_text)
+    _pending_full[user_id] = (raw, metrics_text, metrics)
     if len(_pending_full) > mog_config.PENDING_LIMIT:
         for old in list(_pending_full.keys())[: len(_pending_full) - mog_config.PENDING_LIMIT]:
             _pending_full.pop(old, None)
@@ -1211,13 +1229,14 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             log.info("metrics: %s", metrics_text)
             await status.edit_text("🧠 Нейронка думает…")
         else:
-            metrics_text = format_metrics({"face_found": False, "error": "biometry_unavailable"})
+            metrics = {"face_found": False, "error": "biometry_unavailable"}
+            metrics_text = format_metrics(metrics)
 
         # 2. Первый слой: разбор простыми словами (тоже в треде)
         simple = await asyncio.to_thread(analyze_simple, raw, metrics_text)
 
         # Запоминаем контекст для кнопки "подробный разбор"
-        _remember_photo(msg.from_user.id, raw, metrics_text)
+        _remember_photo(msg.from_user.id, raw, metrics_text, metrics)
 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1281,7 +1300,7 @@ async def on_full_roast(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer("Фото устарело — кинь заново 👇", show_alert=True)
         return
     await cb.answer("Готовлю жесть…")
-    raw, metrics_text = data
+    raw, metrics_text, _m = data
     status = await cb.message.answer("🧠 Нейронка думает…")
     try:
         # Полный разбор (в треде — сетевой вызов синхронный)
@@ -1313,7 +1332,7 @@ async def on_weakspots(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer("Фото устарело — кинь заново 👇", show_alert=True)
         return
     await cb.answer("Рисую неон-скан…")
-    raw, _metrics = data
+    raw, _metrics_text, _m = data
     try:
         from game import rolls as mog_rolls
 
@@ -1337,9 +1356,9 @@ async def on_metrics(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer("Фото устарело — кинь заново 👇", show_alert=True)
         return
     await cb.answer("Под капот…")
-    _raw, metrics_text = data
+    _raw, metrics_text, metrics = data
     await cb.message.answer(
-        f"🧬 <b>ТЕХ-ЗАМЕРЫ</b> <i>(под капот)</i>\n<code>{metrics_text}</code>",
+        f"🧬 <b>ТЕХ-ЗАМЕРЫ</b> <i>(под капот)</i>\n{format_metrics_ui(metrics)}",
         parse_mode="HTML",
     )
 
