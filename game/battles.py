@@ -21,6 +21,35 @@ async def create(chat_id: int, challenger: dict, opponent: dict) -> int:
     )
 
 
+async def create_open(chat_id: int, challenger: dict) -> int:
+    """Открытый вызов: оппонента нет (opponent_id=0) — кто первый примет, тот и бой."""
+    best = await db.get_best_roll(challenger["id"])
+    challenger_score = best["score"] if best else 0.0
+    return await db.create_battle(
+        chat_id=chat_id,
+        challenger_id=challenger["id"],
+        challenger_name=challenger["name"],
+        challenger_score=challenger_score,
+        opponent_id=0,
+        opponent_name="",
+    )
+
+
+async def accept(battle_id: int, user: dict) -> tuple[bool, str]:
+    """Принять вызов кнопкой. Работает и для открытого (0), и для адресного вызова."""
+    battle = await db.get_battle(battle_id)
+    if not battle or battle["status"] != "pending":
+        return False, "Этот вызов уже закрыт."
+    if battle["challenger_id"] == user["id"]:
+        return False, "Себя нельзя — позови другого 😈"
+    opp = battle["opponent_id"] or 0
+    if opp and opp != user["id"]:
+        return False, "Вызов уже принят другим."
+    if not opp:
+        await db.set_battle_opponent(battle_id, user["id"], user["name"])
+    return True, "Принято ⚔️"
+
+
 async def resolve(battle_id: int, opponent_score: float) -> dict:
     """Фиксирует ролл оппонента и определяет победителя (draw при равенстве)."""
     await db.set_opponent_roll(battle_id, opponent_score)

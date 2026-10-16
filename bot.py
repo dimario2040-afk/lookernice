@@ -729,68 +729,149 @@ async def cmd_help(msg: Message) -> None:
         "1. Фото при дневном свете, камера на уровне глаз\n"
         "2. Нейтральное лицо, губы сомкнуты\n"
         "3. Без очков, кепок, фильтров и жёсткого ракурса снизу\n\n"
-        "Просто отправь фото в чат 👇",
+        "Просто отправь фото в чат 👇\n\n"
+        "⚔️ Бател: ответь на сообщение и напиши /mog — или /mog без ответа "
+        "(открытый вызов, кто примет кнопкой).\n"
+        "🏆 Арена до 8: /arena в группе.",
     )
 
 
 @dp.message(Command("mog"))
 async def cmd_mog(msg: Message) -> None:
-    """Публичный вызов на мог-батл: ответь на сообщение + /mog или /mog @user."""
+    """Вызов на мог-батл: ответь+ /mog (адресно) или /mog без ответа (открытый вызов)."""
+    if msg.chat.type == "private":
+        await msg.answer(
+            "⚔️ Баттлы — для группового чата. Добавь меня в группу и вызови /mog"
+        )
+        return
     from game import battles as mog_battles
     from game import db as mog_db
+
+    await mog_db.get_or_create_user(
+        msg.from_user.id, msg.from_user.full_name, msg.from_user.username or ""
+    )
+    challenger = {"id": msg.from_user.id, "name": msg.from_user.full_name}
 
     opponent = None
     target = msg.reply_to_message
     if target and target.from_user and not target.from_user.is_bot:
-        fu = target.from_user
-        if fu.id != msg.from_user.id:
-            opponent = {"id": fu.id, "name": fu.full_name}
+        if target.from_user.id != msg.from_user.id:
+            opponent = {"id": target.from_user.id, "name": target.from_user.full_name}
     if opponent is None:
         for ent in msg.entities or []:
             if ent.type == "text_mention" and ent.user and not ent.user.is_bot:
                 if ent.user.id != msg.from_user.id:
                     opponent = {"id": ent.user.id, "name": ent.user.full_name}
                 break
-    if opponent is None:
-        await msg.reply(
-            "Ткни, кого могнуть: ответь на его сообщение и напиши /mog — "
-            "или упомяни его через @username."
-        )
-        return
 
-    challenger = {"id": msg.from_user.id, "name": msg.from_user.full_name}
     try:
-        battle_id = await mog_battles.create(msg.chat.id, challenger, opponent)
-    except Exception as exc:  # noqa: BLE001 — БД может быть не инициализирована
+        if opponent is None:
+            battle_id = await mog_battles.create_open(msg.chat.id, challenger)
+        else:
+            battle_id = await mog_battles.create(msg.chat.id, challenger, opponent)
+    except Exception:  # noqa: BLE001 — БД может быть не инициализирована
         log.exception("battle create failed")
         await msg.reply(f"💥 {PUBLIC_ERROR}")
         return
 
-    text = (
-        f"⚔️ <b>{challenger['name']}</b> вызывает <b>{opponent['name']}</b> "
-        "на МОГ-БАТТЛ!\n\n"
-        f"{opponent['name']}, просто пришли <b>своё фото</b> в этот чат — и бой закрыт. "
-        "Кто кого смог."
-    )
+    if opponent is None:
+        text = (
+            f"⚔️ <b>{challenger['name']}</b> бросает открытый вызов!\n\n"
+            "Кто первый жмёт «Принять» — тот и в бою. "
+            "Счёт — твой лучший МОГ. После — просто кинь фото в чат."
+        )
+        kb = _duel_keyboard(battle_id, open_challenge=True)
+    else:
+        text = (
+            f"⚔️ <b>{challenger['name']}</b> вызывает <b>{opponent['name']}</b> "
+            "на МОГ-БАТТЛ!\n\n"
+            f"{opponent['name']}, жми «Принять» — или просто пришли <b>своё фото</b> в чат."
+        )
+        kb = _duel_keyboard(battle_id, open_challenge=False)
+
     trial = await mog_db.get_battle(battle_id)
     if trial and not trial["challenger_score"]:
         text += (
-            "\n\n⚠️ У вызывающего ещё нет ролла — его счёт 0.0000. "
+            "\n\n⚠️ У вызывающего ещё нет ролла — счёт 0.0000. "
             "Пусть сначала кинет фото в чат."
         )
-    kb = None
-    if PUBLIC_BASE_URL:
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⚔️ Принять бой (мини-апп)",
-                        web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/app?battle={battle_id}"),
-                    )
-                ]
+    await msg.reply(text, reply_markup=kb, parse_mode="HTML")
+
+
+def _duel_keyboard(battle_id: int, *, open_challenge: bool):
+    """Кнопка принятия вызова (чат). Для адресного — плюс мини-апп, если есть URL."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="⚔️ Принять вызов", callback_data=f"duel_accept:{battle_id}"
+            )
+        ]
+    ]
+    if not open_challenge and PUBLIC_BASE_URL:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Принять в приложении",
+                    web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/app?battle={battle_id}"),
+                )
             ]
         )
-    await msg.reply(text, reply_markup=kb, parse_mode="HTML")
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.startswith("duel_accept:"))
+async def on_duel_accept(cb: CallbackQuery) -> None:
+    """Оппонент принял вызов кнопкой → просим фото, снимаем кнопку."""
+    battle_id = int(cb.data.split(":", 1)[1])
+    from game import battles as mog_battles
+    from game import db as mog_db
+
+    await mog_db.get_or_create_user(
+        cb.from_user.id, cb.from_user.full_name, cb.from_user.username or ""
+    )
+    user = {"id": cb.from_user.id, "name": cb.from_user.full_name}
+    ok, reason = await mog_battles.accept(battle_id, user)
+    if not ok:
+        await cb.answer(reason, show_alert=True)
+        return
+    await cb.answer("Принято ⚔️")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001 — сообщение старое/неизменно
+        pass
+    await cb.message.answer(
+        f"⚔️ <b>{user['name']}</b> принял вызов! "
+        "Кидай <b>своё фото</b> в чат — и бой закрыт.",
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data == "duel_new")
+async def on_duel_new(cb: CallbackQuery) -> None:
+    """Кнопка «Вызвать на баттл» под карточкой → открытый вызов в этом чате."""
+    if cb.message.chat.type == "private":
+        await cb.answer("Баттлы — в групповом чате 👥", show_alert=True)
+        return
+    from game import battles as mog_battles
+    from game import db as mog_db
+
+    await mog_db.get_or_create_user(
+        cb.from_user.id, cb.from_user.full_name, cb.from_user.username or ""
+    )
+    challenger = {"id": cb.from_user.id, "name": cb.from_user.full_name}
+    try:
+        battle_id = await mog_battles.create_open(cb.message.chat.id, challenger)
+    except Exception:  # noqa: BLE001
+        log.exception("battle create failed")
+        await cb.answer(PUBLIC_ERROR, show_alert=True)
+        return
+    await cb.answer("Вызов брошен ⚔️")
+    await cb.message.answer(
+        f"⚔️ <b>{challenger['name']}</b> бросает открытый вызов!\n\n"
+        "Кто первый жмёт «Принять» — тот и в бою. Потом просто кинь фото.",
+        reply_markup=_duel_keyboard(battle_id, open_challenge=True),
+        parse_mode="HTML",
+    )
 
 # ───────────────────────── РЕВАНШ ─────────────────────────
 @dp.callback_query(F.data.startswith("rematch:"))
@@ -1329,6 +1410,7 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
             [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
             [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
+            [InlineKeyboardButton(text="⚔️ Вызвать на баттл", callback_data="duel_new")],
         ]
     )
     try:

@@ -349,6 +349,18 @@ async def finish_battle(battle_id: int, winner_id: int | None) -> None:
     await _db.commit()
 
 
+async def set_battle_opponent(
+    battle_id: int, opponent_id: int, opponent_name: str
+) -> None:
+    """Назначает оппонента открытому вызову (opponent_id=0 → реальный юзер)."""
+    assert _db is not None
+    await _db.execute(
+        "UPDATE battles SET opponent_id=?, opponent_name=? WHERE id=?",
+        (opponent_id, opponent_name, battle_id),
+    )
+    await _db.commit()
+
+
 async def find_pending_battle(chat_id: int, opponent_id: int) -> dict | None:
     """Свежий незакрытый батл в этом чате, где юзер — оппонент (ждёт его фото)."""
     assert _db is not None
