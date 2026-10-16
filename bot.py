@@ -332,7 +332,16 @@ _VLM_PROVIDERS = [
         "AIHUBMIX_API_KEY",
         _vlm_env("AIHUBMIX_MODELS", "gpt-4o-mini"),
     ),
-    # 4) z.ai / Zhipu (ключ MODEL_API_KEY) — уже настроен, glm-4.6v-flash, часто 429.
+    # 4) Alibaba DashScope — дешёвый Qwen-VL (vision), работает из РФ.
+    #    Ключ DASHSCOPE_API_KEY (https://dashscope.console.aliyun.com).
+    (
+        "dashscope",
+        _vlm_env("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        "DASHSCOPE_API_KEY",
+        _vlm_env("DASHSCOPE_MODELS", "qwen-vl-plus,qwen-vl-max,qwen2.5-vl-72b-instruct"),
+    ),
+    # 5) z.ai / Zhipu (ключ MODEL_API_KEY) — glm-4.6v-flash бесплатный, часто 429;
+    #    glm-4.6v платный-но-дешёвый (в MODEL_FALLBACKS) — включается при балансе.
     (
         "zhipu",
         MODEL_BASE_URL,

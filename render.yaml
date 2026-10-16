@@ -33,6 +33,8 @@ services:
         sync: false
       - key: AIHUBMIX_API_KEY
         sync: false
+      - key: DASHSCOPE_API_KEY
+        sync: false
       - key: OPENROUTER_API_KEY
         sync: false
       - key: WEBHOOK_SECRET
