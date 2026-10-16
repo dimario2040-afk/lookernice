@@ -873,6 +873,42 @@ async def on_duel_new(cb: CallbackQuery) -> None:
         parse_mode="HTML",
     )
 
+@dp.callback_query(F.data == "arena_quick")
+async def on_arena_quick(cb: CallbackQuery) -> None:
+    """Кнопка «Общий баттл» под карточкой → открыть/войти в чатовую МОГ-АРЕНУ."""
+    if cb.message.chat.type == "private":
+        await cb.answer("Баттлы — в групповом чате 👥", show_alert=True)
+        return
+    from game import arena as mog_arena
+    from game import db as mog_db
+
+    await mog_db.get_or_create_user(
+        cb.from_user.id, cb.from_user.full_name, cb.from_user.username or ""
+    )
+    host = {"id": cb.from_user.id, "name": cb.from_user.full_name}
+    try:
+        arena, created = await mog_arena.create(cb.message.chat.id, host)
+        plist = await mog_arena.players(arena["id"])
+        if any(p["user_id"] == host["id"] for p in plist):
+            ok, reason = True, "Ты уже в деле ⚔️"
+        else:
+            ok, reason = await mog_arena.join(arena["id"], host)
+    except Exception:  # noqa: BLE001
+        log.exception("arena quick failed")
+        await cb.answer(PUBLIC_ERROR, show_alert=True)
+        return
+    if not ok:
+        await cb.answer(reason, show_alert=True)
+        return
+    await cb.answer("Общий баттл! 🔥" if created else "Ты в арене ⚔️")
+    plist = await mog_arena.players(arena["id"])
+    await cb.message.answer(
+        mog_arena.lobby_text(arena, plist),
+        reply_markup=mog_arena.lobby_keyboard(arena, plist),
+        parse_mode="HTML",
+    )
+
+
 # ───────────────────────── РЕВАНШ ─────────────────────────
 @dp.callback_query(F.data.startswith("rematch:"))
 async def on_rematch(cb: CallbackQuery) -> None:
@@ -1407,10 +1443,13 @@ async def on_photo(msg: Message, bot: Bot) -> None:
     metrics_text = format_metrics(metrics)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⚔️ Дуэль 1×1", callback_data="duel_new"),
+                InlineKeyboardButton(text="🏆 Общий баттл", callback_data="arena_quick"),
+            ],
             [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
             [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
             [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
-            [InlineKeyboardButton(text="⚔️ Вызвать на баттл", callback_data="duel_new")],
         ]
     )
     try:
