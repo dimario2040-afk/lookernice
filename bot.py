@@ -12,6 +12,7 @@ import math
 import os
 import random
 import tempfile
+import time
 
 # Тяжёлая биометрия — ОПЦИОНАЛЬНА: на free-хостинге (Render, 512MB RAM)
 # mediapipe не влезет, и бот должен работать без него (только VLM по фото).
@@ -704,6 +705,21 @@ def _remember_photo(user_id: int, raw: bytes, metrics_text: str, metrics: dict) 
     if len(_pending_full) > mog_config.PENDING_LIMIT:
         for old in list(_pending_full.keys())[: len(_pending_full) - mog_config.PENDING_LIMIT]:
             _pending_full.pop(old, None)
+
+
+# Фото, ждущие согласия: user_id -> (unix_ts, raw байты). TTL — чтобы бот не таскал
+# старые фото после отложенного нажатия «Согласен». Лимит — тот же PENDING_LIMIT.
+_CONSENT_PHOTO_TTL = 15 * 60
+_pending_consent: dict[int, tuple[float, bytes]] = {}
+
+
+def _stash_consent_photo(user_id: int, raw: bytes) -> None:
+    from game import config as mog_config
+
+    _pending_consent[user_id] = (time.time(), raw)
+    if len(_pending_consent) > mog_config.PENDING_LIMIT:
+        for old in list(_pending_consent.keys())[: len(_pending_consent) - mog_config.PENDING_LIMIT]:
+            _pending_consent.pop(old, None)
 
 # ---------------------------------------------------------------- бот
 dp = Dispatcher()
@@ -1897,7 +1913,6 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str) -> bytes:
     return buf.getvalue()
 
 
-@dp.message(F.photo)
 @dp.message(Command("legal", "privacy", "consent"))
 async def cmd_legal(msg: Message) -> None:
     """Правила и согласие на обработку данных (дублирует веб-страницу)."""
@@ -1969,8 +1984,8 @@ async def _ensure_consent(msg: Message, bot: Bot, intro: str = "") -> bool:
 
 
 @dp.callback_query(F.data.startswith("consent:"))
-async def on_consent(cb: CallbackQuery) -> None:
-    """Фиксация согласия на обработку ПДн (с версией политики и таймстампом)."""
+async def on_consent(cb: CallbackQuery, bot: Bot) -> None:
+    """Фиксация согласия; если фото уже прислали — запускаем его разбор сразу."""
     from game import db as mog_db
 
     version = (cb.data or "").split(":", 1)[-1]
@@ -1981,37 +1996,59 @@ async def on_consent(cb: CallbackQuery) -> None:
     except Exception:  # noqa: BLE001 — старое/неизменное сообщение
         pass
     await cb.message.answer(
-        f"✅ <b>Согласие зафиксировано</b> (политика v{version}, {ts}).\n"
-        "Теперь кидай фото 👇",
+        f"✅ <b>Согласие зафиксировано</b> (политика v{version}, {ts}).",
         parse_mode="HTML",
     )
+    # 📸 Фото, присланное до согласия, — считаем без повторной отправки.
+    entry = _pending_consent.pop(cb.from_user.id, None)
+    if entry:
+        stored_at, raw = entry
+        if time.time() - stored_at <= _CONSENT_PHOTO_TTL and raw:
+            await cb.message.answer("📸 Вижу твоё фото — начинаю разбор 👇")
+            await _process_photo(cb.message, bot, raw)
+            return
+    await cb.message.answer("Теперь кидай фото 👇")
 
 
+@dp.message(F.photo)
 async def on_photo(msg: Message, bot: Bot) -> None:
     if not TELEGRAM_TOKEN or not MODEL_API_KEY:
         await msg.answer("⚠️ Бот не настроен: нет TELEGRAM_TOKEN или MODEL_API_KEY в .env")
         return
 
-    # 🔞 Без согласия на обработку ПДн фото не обрабатываем.
-    if not await _ensure_consent(msg, bot):
+    # 📸 Скачиваем фото ДО проверки согласия — чтобы после кнопки «Согласен»
+    # разбор стартовал сразу, без повторной отправки фото.
+    try:
+        photo = msg.photo[-1]  # самое большое разрешение
+        tg_file = await bot.get_file(photo.file_id)
+        photo_bytes = await bot.download_file(tg_file.file_path)
+        raw = photo_bytes.read()
+    except Exception:  # noqa: BLE001
+        log.exception("photo download failed")
+        await msg.answer("Не смог скачать фото. Отправь ещё раз 📸")
         return
 
+    # 🔞 Без согласия на обработку ПДн фото не обрабатываем — но запоминаем
+    # байты: нажатие «Согласен» запустит обработку этого фото автоматически.
+    if not await _ensure_consent(msg, bot):
+        _stash_consent_photo(msg.from_user.id, raw)
+        return
+
+    await _process_photo(msg, bot, raw)
+
+
+async def _process_photo(msg: Message, bot: Bot, raw: bytes) -> None:
+    """Полный разбор: дуэль → биометрия → нейронка → печать «МОГ» + кнопки."""
     status = await msg.answer(
         "📐 Изучаю пропорции…" if BIOMETRY_AVAILABLE else "🧠 Нейронка думает…"
     )
     tmp_path = ""
-    raw = b""
     # Нейтральные значения на случай сбоя ДО их вычисления: локальная печать «МОГ»
     # и кнопки не должны зависеть от нейронки (она может быть на 429).
     metrics = {"face_found": False, "error": "biometry_unavailable"}
     metrics_text = format_metrics(metrics)
     kb = await _card_keyboard_for(msg.from_user.id)
     try:
-        photo = msg.photo[-1]  # самое большое разрешение
-        tg_file = await bot.get_file(photo.file_id)
-        photo_bytes = await bot.download_file(tg_file.file_path)
-        raw = photo_bytes.read()
-
         # ⚔️ ДУЭЛЬ: если этого юзера вызвали на бой — его фото закрывает батл.
         # Работает прямо в чате, без мини-аппа и без HTTPS.
         try:
