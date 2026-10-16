@@ -888,15 +888,22 @@ _MOG_PUNCHLINES = (
 )
 
 
-def _mog_tag(photo_bytes: bytes) -> str:
-    """МОГ-балл + две смешные добивки + дисклеймер для любой выдачи (спек §7)."""
-    import hashlib
-
-    from game import config as mog_config
+def _mog_score_tier(photo_bytes: bytes) -> tuple[float, str]:
+    """Детерминированные МОГ-балл и тир из фото."""
     from game import rolls as mog_rolls
 
     score = round(mog_rolls.base_score(photo_bytes), 4)
-    tier = mog_rolls.tier_for(score)
+    return score, mog_rolls.tier_for(score)
+
+
+def _mog_tag(photo_bytes: bytes, score: float | None = None, tier: str | None = None) -> str:
+    """МОГ-балл + смешная добивка + дисклеймер для любой выдачи (спек §7)."""
+    import hashlib
+
+    from game import config as mog_config
+
+    if score is None or tier is None:
+        score, tier = _mog_score_tier(photo_bytes)
     punch = _MOG_PUNCHLINES[
         int(hashlib.sha256(photo_bytes).hexdigest(), 16) % len(_MOG_PUNCHLINES)
     ]
@@ -906,8 +913,9 @@ def _mog_tag(photo_bytes: bytes) -> str:
     )
 
 
-# ───────────────────────── НЕОН-СКАН «СЛАБЫЕ МЕСТА» ─────────────────────────
-# Рисует киберпанк-рамки поверх зон лица: красным — стремные, зелёным — хорошие.
+# ───────────────────────── СКАН «СЛАБЫЕ МЕСТА» ─────────────────────────
+# Тонкий контур (1–3 px) по зонам лица: красным — слабые, синим — сильные.
+# Фото не портим: только линия, без заливки и свечения.
 # Позиции зон берём из FaceMesh; если биометрии нет — падаем на доли кадра.
 
 SPOT_REGIONS: list[tuple[str, str]] = [
@@ -931,40 +939,25 @@ _SPOT_IDX = {
 }
 
 
-# Сила неон-скана: 1.0 — как в оригинале; 0.10 — на 90% слабее.
-# Меняется без правки кода: MOG_SPOT_OPACITY=0.05 в .env.
-SPOT_OPACITY = float(os.getenv("MOG_SPOT_OPACITY", "0.10"))
-
-
-def _fade(img, factor: float):
-    """Ослабляет RGBA-слой в factor раз (по альфе). factor>=1 — без изменений."""
-    if factor >= 1.0:
-        return img
-    out = img.copy()
-    out.putalpha(img.getchannel("A").point(lambda v: int(v * factor)))
-    return out
+# Тонкий контур зоны: 1–3 px, без glow и «корон» — фото не портим.
+# Толщина настраивается из .env: MOG_SPOT_LINE=1..3 (по умолчанию 2).
+SPOT_LINE_WIDTH = max(1, min(3, int(os.getenv("MOG_SPOT_LINE", "2"))))
 
 
 def _neon_color(score: int) -> tuple[int, int, int]:
     if score < 40:
-        return (255, 45, 94)    # неон-красный — слабое место
+        return (255, 45, 94)    # красный — слабая зона
     if score >= 60:
-        return (57, 255, 136)   # неон-зелёный — сильная зона
-    return (34, 211, 238)       # циан — нейтрально
+        return (56, 132, 255)   # синий — сильная зона
+    return (34, 211, 238)       # циан — нейтрально (в скане не обводим)
 
 
 def _draw_neon(d, box, color) -> None:
-    """Рамка с «короной» по углам + многослойным glow."""
+    """Тонкий контур зоны (1–3 px) — только линия, без заливки и свечения."""
     x1, y1, x2, y2 = (int(v) for v in box)
     if x2 <= x1 or y2 <= y1:
         return
-    for width, alpha in ((14, 30), (8, 65), (3, 150)):
-        d.rectangle([x1, y1, x2, y2], outline=color + (alpha,), width=width)
-    d.rectangle([x1, y1, x2, y2], outline=(255, 255, 255, 235), width=1)
-    ln = max(10, int(min(x2 - x1, y2 - y1) * 0.18))
-    for cx, cy, dx, dy in ((x1, y1, 1, 1), (x2, y1, -1, 1), (x1, y2, 1, -1), (x2, y2, -1, -1)):
-        d.line([(cx, cy), (cx + dx * ln, cy)], fill=color + (255,), width=3)
-        d.line([(cx, cy), (cx, cy + dy * ln)], fill=color + (255,), width=3)
+    d.rectangle([x1, y1, x2, y2], outline=color + (235,), width=SPOT_LINE_WIDTH)
 
 
 def _box_from_points(pts, idxs, w, h, pad_x=0.0, pad_y=0.0):
@@ -1041,16 +1034,14 @@ def annotate_weakspots(image_bytes: bytes, stats: dict) -> tuple[bytes, list]:
         if not box:
             continue
         score = int(stats.get(key, 50))
+        if 40 <= score < 60:
+            continue  # нейтральные зоны не обводим — только слабые/сильные
         color = _neon_color(score)
         _draw_neon(d, box, color)
         items.append((key, label, score, color))
 
-    glow = overlay.filter(ImageFilter.GaussianBlur(6))
     base = img.convert("RGBA")
-    out = Image.alpha_composite(
-        Image.alpha_composite(base, _fade(glow, SPOT_OPACITY)),
-        _fade(overlay, SPOT_OPACITY),
-    )
+    out = Image.alpha_composite(base, overlay)
     if out.width > 1080:
         ratio = 1080 / out.width
         out = out.resize((1080, int(out.height * ratio)))
@@ -1066,10 +1057,109 @@ def spots_caption(items: list) -> str:
     good = [f"{lab} {sc}" for _k, lab, sc, _c in items if sc >= 60]
     lines = ["🎯 <b>СЛАБЫЕ МЕСТА</b> · неон-скан", ""]
     lines.append("🔴 зоны урона: " + (", ".join(weak) if weak else "нет"))
-    lines.append("🟢 halo: " + (", ".join(good) if good else "нет"))
+    lines.append("🔵 halo: " + (", ".join(good) if good else "нет"))
     lines.append("")
     lines.append(f"<i>{mog_config.DISCLAIMER}</i>")
     return "\n".join(lines)
+
+
+# ───────────────────────── ПЕЧАТЬ «МОГ» НА ФОТО ─────────────────────────
+# Возвращает то же фото с неон-штампом «МОГ <балл> · тир» в углу — для репоста.
+
+
+def _load_font(size: int):
+    """Кириллический шрифт: сперва наш в репо, потом системные, потом дефолт."""
+    from PIL import ImageFont
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (
+        os.path.join(here, "assets", "fonts", "DejaVuSans-Bold.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:  # noqa: BLE001
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except Exception:  # noqa: BLE001
+        return ImageFont.load_default()
+
+
+def _mog_stamp(photo_bytes: bytes, score: float, tier: str) -> bytes:
+    """Фото + неон-печать «МОГ <балл> · тир» в правом нижнем углу (JPEG bytes)."""
+    from PIL import Image, ImageDraw, ImageFilter
+
+    img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+    W, H = img.size
+    color = _neon_color(int(round(score / 10.0 * 100)))
+    lab, sc, ti = "МОГ", f"{score:.4f}", tier.upper()
+
+    # Размер печати ≈ 34% короткой стороны; шрифт балла подгоняем под ширину.
+    target_w = max(150, int(min(W, H) * 0.34))
+    size = max(18, int(target_w * 0.20))
+    f_sc = _load_font(size)
+    for _ in range(12):
+        bb = f_sc.getbbox(sc)
+        w = bb[2] - bb[0]
+        if w <= target_w * 0.74 or size <= 18:
+            break
+        size = max(18, int(size * (target_w * 0.74) / max(1, w)))
+        f_sc = _load_font(size)
+    f_lab = _load_font(max(14, int(size * 0.50)))
+    f_ti = _load_font(max(12, int(size * 0.42)))
+
+    md = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
+    b_lab = md.textbbox((0, 0), lab, font=f_lab)
+    b_sc = md.textbbox((0, 0), sc, font=f_sc)
+    b_ti = md.textbbox((0, 0), ti, font=f_ti)
+    h_lab, h_sc, h_ti = b_lab[3] - b_lab[1], b_sc[3] - b_sc[1], b_ti[3] - b_ti[1]
+    inner_w = max(b_lab[2] - b_lab[0], b_sc[2] - b_sc[0], b_ti[2] - b_ti[0])
+
+    gap = max(4, int(size * 0.22))
+    padx, pady = int(size * 0.60), int(size * 0.46)
+    inner_h = h_lab + gap + h_sc + gap + h_ti
+    SW, SH = inner_w + padx * 2, inner_h + pady * 2
+
+    stamp = Image.new("RGBA", (SW, SH), (0, 0, 0, 0))
+    d = ImageDraw.Draw(stamp)
+    radius = int(min(SW, SH) * 0.20)
+    d.rounded_rectangle([0, 0, SW - 1, SH - 1], radius=radius, fill=(8, 8, 16, 135))
+    for width, alpha in ((max(4, int(SH * 0.06)), 45), (max(2, int(SH * 0.03)), 100), (2, 210)):
+        d.rounded_rectangle([0, 0, SW - 1, SH - 1], radius=radius, outline=color + (alpha,), width=width)
+    d.rounded_rectangle([6, 6, SW - 7, SH - 7], radius=max(2, radius - 5), outline=(255, 255, 255, 70), width=1)
+
+    y = pady
+    for i, (txt, font, bbox, fill) in enumerate(
+        (
+            (lab, f_lab, b_lab, (255, 255, 255, 255)),
+            (sc, f_sc, b_sc, color + (255,)),
+            (ti, f_ti, b_ti, (255, 255, 255, 225)),
+        )
+    ):
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        d.text(((SW - tw) // 2 - bbox[0], y - bbox[1]), txt, font=font, fill=fill)
+        y += th + (gap if i < 2 else 0)
+
+    stamp = stamp.rotate(6, expand=True, resample=Image.BICUBIC)
+    glow = stamp.filter(ImageFilter.GaussianBlur(4))
+
+    margin = int(min(W, H) * 0.035)
+    px = max(0, W - stamp.width - margin)
+    py = max(0, H - stamp.height - margin)
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    overlay.alpha_composite(glow, (px, py))
+    overlay.alpha_composite(stamp, (px, py))
+
+    out = Image.alpha_composite(img.convert("RGBA"), overlay)
+    if out.width > 1080:
+        ratio = 1080 / out.width
+        out = out.resize((1080, int(out.height * ratio)))
+    buf = io.BytesIO()
+    out.convert("RGB").save(buf, "JPEG", quality=90)
+    return buf.getvalue()
 
 
 @dp.message(F.photo)
@@ -1137,7 +1227,20 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             ]
         )
         await status.delete()
-        mog_line = _mog_tag(raw)
+        score, tier = _mog_score_tier(raw)
+        mog_line = _mog_tag(raw, score, tier)
+
+        # Печать «МОГ» на фото — готово к репосту. Не роняем разбор, если не нарисуется.
+        try:
+            card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
+            await msg.answer_photo(
+                BufferedInputFile(card, filename="mog_card.jpg"),
+                caption=f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n😏 Печать стоит — кинь другу",
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("stamp failed")
+
         if simple:
             # Футер-вирус: подталкиваем переслать другу (ретеншн).
             await msg.answer(
