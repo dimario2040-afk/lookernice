@@ -1190,6 +1190,18 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         "📐 Изучаю пропорции…" if BIOMETRY_AVAILABLE else "🧠 Нейронка думает…"
     )
     tmp_path = ""
+    raw = b""
+    # Нейтральные значения на случай сбоя ДО их вычисления: локальная печать «МОГ»
+    # и кнопки не должны зависеть от нейронки (она может быть на 429).
+    metrics = {"face_found": False, "error": "biometry_unavailable"}
+    metrics_text = format_metrics(metrics)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
+            [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
+            [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
+        ]
+    )
     try:
         photo = msg.photo[-1]  # самое большое разрешение
         tg_file = await bot.get_file(photo.file_id)
@@ -1238,13 +1250,6 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         # Запоминаем контекст для кнопки "подробный разбор"
         _remember_photo(msg.from_user.id, raw, metrics_text, metrics)
 
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
-                [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
-                [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
-            ]
-        )
         await status.delete()
         score, tier = _mog_score_tier(raw)
         mog_line = _mog_tag(raw, score, tier)
@@ -1277,7 +1282,29 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             )
     except Exception as exc:  # noqa: BLE001 — юзер должен видеть ошибку текстом
         log.exception("photo handling failed")
-        await msg.answer(_friendly_error(exc) + "\nПопробуй другое фото.")
+        # Нейронка могла упасть на 429 — но печать «МОГ» и кнопки ЛОКАЛЬНЫ и
+        # работают всегда. Отдаём их, чтобы юзер не остался без вирусной карточки.
+        sent_card = False
+        if raw:
+            try:
+                score, tier = _mog_score_tier(raw)
+                _remember_photo(msg.from_user.id, raw, metrics_text, metrics)
+                card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
+                await msg.answer_photo(
+                    BufferedInputFile(card, filename="mog_card.jpg"),
+                    caption=f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n😏 Печать стоит — кинь другу",
+                    parse_mode="HTML",
+                )
+                await msg.answer(
+                    _friendly_error(exc) + "\nПечать твоя 👆 Кнопки ниже живут без нейронки.",
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+                sent_card = True
+            except Exception:  # noqa: BLE001
+                log.exception("fallback card failed")
+        if not sent_card:
+            await msg.answer(_friendly_error(exc) + "\nПопробуй другое фото.")
         try:
             await status.delete()
         except Exception:  # noqa: BLE001, S110
