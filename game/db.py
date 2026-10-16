@@ -55,6 +55,26 @@ CREATE TABLE IF NOT EXISTS battles (
     winner_id        INTEGER,
     created_at       TEXT    NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS arenas (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    host_id     INTEGER NOT NULL,
+    host_name   TEXT    NOT NULL DEFAULT '',
+    max_players INTEGER NOT NULL DEFAULT 8,
+    status      TEXT    NOT NULL DEFAULT 'lobby',
+    created_at  TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS arena_players (
+    arena_id  INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    name      TEXT    NOT NULL DEFAULT '',
+    score     REAL    NOT NULL DEFAULT 0,
+    tier      TEXT    NOT NULL DEFAULT 'Common',
+    joined_at TEXT    NOT NULL DEFAULT '',
+    UNIQUE(arena_id, user_id)
+);
 """
 
 
@@ -339,3 +359,86 @@ async def find_pending_battle(chat_id: int, opponent_id: int) -> dict | None:
     )
     row = await cur.fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------- arena
+
+
+async def create_arena(
+    chat_id: int, host_id: int, host_name: str, max_players: int
+) -> int:
+    assert _db is not None
+    cur = await _db.execute(
+        "INSERT INTO arenas (chat_id, host_id, host_name, max_players, status, created_at)"
+        " VALUES (?,?,?,?,'lobby',?)",
+        (chat_id, host_id, host_name, max_players, _now()),
+    )
+    await _db.commit()
+    return int(cur.lastrowid)
+
+
+async def get_arena(arena_id: int) -> dict | None:
+    assert _db is not None
+    cur = await _db.execute("SELECT * FROM arenas WHERE id=?", (arena_id,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def get_active_arena(chat_id: int) -> dict | None:
+    """Свежайшее лобби в чате (status='lobby'), если есть."""
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT * FROM arenas WHERE chat_id=? AND status='lobby' ORDER BY id DESC LIMIT 1",
+        (chat_id,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def set_arena_status(arena_id: int, status: str) -> None:
+    assert _db is not None
+    await _db.execute("UPDATE arenas SET status=? WHERE id=?", (status, arena_id))
+    await _db.commit()
+
+
+async def add_arena_player(
+    arena_id: int, user_id: int, name: str, score: float, tier: str
+) -> bool:
+    """True — добавили; False — уже был в игре (UNIQUE)."""
+    assert _db is not None
+    try:
+        await _db.execute(
+            "INSERT INTO arena_players (arena_id, user_id, name, score, tier, joined_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (arena_id, user_id, name, score, tier, _now()),
+        )
+        await _db.commit()
+        return True
+    except Exception:  # noqa: BLE001 — UNIQUE(arena_id,user_id): уже в списке
+        return False
+
+
+async def remove_arena_player(arena_id: int, user_id: int) -> bool:
+    assert _db is not None
+    cur = await _db.execute(
+        "DELETE FROM arena_players WHERE arena_id=? AND user_id=?", (arena_id, user_id)
+    )
+    await _db.commit()
+    return cur.rowcount > 0
+
+
+async def arena_players(arena_id: int) -> list[dict]:
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT * FROM arena_players WHERE arena_id=? ORDER BY score DESC", (arena_id,)
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def arena_count(arena_id: int) -> int:
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT COUNT(*) AS n FROM arena_players WHERE arena_id=?", (arena_id,)
+    )
+    row = await cur.fetchone()
+    return int(row["n"]) if row else 0

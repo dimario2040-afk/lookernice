@@ -829,6 +829,135 @@ async def on_rematch(cb: CallbackQuery) -> None:
     log.info("rematch #%s -> battle #%s", battle_id, new_id)
 
 
+# ---------------------------------------------------------------- MOG-АРЕНА (битва до 8, чат)
+async def _arena_render_lobby(message, arena_id: int) -> None:
+    """Перерисовывает лобби-сообщение (не роня при старом/неизменном сообщении)."""
+    from game import arena as mog_arena
+    from game import db as mog_db
+
+    arena = await mog_db.get_arena(arena_id)
+    if not arena:
+        return
+    plist = await mog_arena.players(arena_id)
+    try:
+        await message.edit_text(
+            mog_arena.lobby_text(arena, plist),
+            reply_markup=mog_arena.lobby_keyboard(arena, plist),
+            parse_mode="HTML",
+        )
+    except Exception:  # noqa: BLE001 — текст не изменился или сообщение устарело
+        pass
+
+
+async def _arena_finish(message, arena_id: int) -> None:
+    """Резолвит арену и публикует финальное табло."""
+    from game import arena as mog_arena
+    from game import db as mog_db
+
+    arena = await mog_db.get_arena(arena_id)
+    if not arena:
+        return
+    plist = await mog_arena.resolve(arena_id)
+    text = mog_arena.result_text(arena, plist)
+    kb = mog_arena.rematch_keyboard(arena_id)
+    try:
+        await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.message(Command("arena", "арена"))
+async def cmd_arena(msg: Message) -> None:
+    """Открывает чатовую битву МОГ до 8 игроков (без мини-аппа)."""
+    if msg.chat.type == "private":
+        await msg.answer(
+            "⚔️ Арена — для группового чата. Добавь меня в группу и вызови /arena"
+        )
+        return
+    from game import arena as mog_arena
+    from game import db as mog_db
+
+    await mog_db.get_or_create_user(
+        msg.from_user.id, msg.from_user.full_name, msg.from_user.username or ""
+    )
+    host = {"id": msg.from_user.id, "name": msg.from_user.full_name}
+    arena, _created = await mog_arena.create(msg.chat.id, host)
+    plist = await mog_arena.players(arena["id"])
+    await msg.answer(
+        mog_arena.lobby_text(arena, plist),
+        reply_markup=mog_arena.lobby_keyboard(arena, plist),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("arena_join:"))
+async def on_arena_join(cb: CallbackQuery) -> None:
+    arena_id = int(cb.data.split(":", 1)[1])
+    from game import arena as mog_arena
+    from game import db as mog_db
+
+    await mog_db.get_or_create_user(
+        cb.from_user.id, cb.from_user.full_name, cb.from_user.username or ""
+    )
+    user = {"id": cb.from_user.id, "name": cb.from_user.full_name}
+    ok, reason = await mog_arena.join(arena_id, user)
+    if not ok:
+        await cb.answer(reason, show_alert=True)
+        return
+    await cb.answer(reason)
+    arena = await mog_db.get_arena(arena_id)
+    if arena and await mog_db.arena_count(arena_id) >= arena["max_players"]:
+        await _arena_finish(cb.message, arena_id)
+    else:
+        await _arena_render_lobby(cb.message, arena_id)
+
+
+@dp.callback_query(F.data.startswith("arena_start:"))
+async def on_arena_start(cb: CallbackQuery) -> None:
+    arena_id = int(cb.data.split(":", 1)[1])
+    from game import arena as mog_arena
+
+    plist = await mog_arena.players(arena_id)
+    if not any(p["user_id"] == cb.from_user.id for p in plist):
+        await cb.answer("Сначала жми «Я в деле» 👇", show_alert=True)
+        return
+    if len(plist) < mog_arena.MIN_PLAYERS:
+        await cb.answer(f"Нужно минимум {mog_arena.MIN_PLAYERS} бойца", show_alert=True)
+        return
+    await cb.answer("Старт! 🔥")
+    await _arena_finish(cb.message, arena_id)
+
+
+@dp.callback_query(F.data.startswith("arena_leave:"))
+async def on_arena_leave(cb: CallbackQuery) -> None:
+    arena_id = int(cb.data.split(":", 1)[1])
+    from game import arena as mog_arena
+
+    ok = await mog_arena.leave(arena_id, cb.from_user.id)
+    await cb.answer("Вышел из арены" if ok else "Ты и не был в деле")
+    if ok:
+        await _arena_render_lobby(cb.message, arena_id)
+
+
+@dp.callback_query(F.data.startswith("arena_new:"))
+async def on_arena_new(cb: CallbackQuery) -> None:
+    from game import arena as mog_arena
+    from game import db as mog_db
+
+    await mog_db.get_or_create_user(
+        cb.from_user.id, cb.from_user.full_name, cb.from_user.username or ""
+    )
+    host = {"id": cb.from_user.id, "name": cb.from_user.full_name}
+    arena, _created = await mog_arena.create(cb.message.chat.id, host)
+    plist = await mog_arena.players(arena["id"])
+    await cb.message.answer(
+        mog_arena.lobby_text(arena, plist),
+        reply_markup=mog_arena.lobby_keyboard(arena, plist),
+        parse_mode="HTML",
+    )
+    await cb.answer("Новая арена ⚔️")
+
+
 # ---------------------------------------------------------------- Stars (оплата)
 @dp.message(Command("buy"))
 async def cmd_buy(msg: Message) -> None:
