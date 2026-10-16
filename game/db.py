@@ -91,6 +91,12 @@ CREATE TABLE IF NOT EXISTS artifact_free (
     day     TEXT    NOT NULL,
     UNIQUE(user_id, day)
 );
+
+CREATE TABLE IF NOT EXISTS consents (
+    user_id    INTEGER PRIMARY KEY,
+    version    TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL DEFAULT ''
+);
 """
 
 
@@ -510,3 +516,28 @@ async def claim_free_artifact(user_id: int) -> bool:
         return True
     except Exception:  # noqa: BLE001 — UNIQUE(user_id, day): уже брали сегодня
         return False
+
+
+# ---------------------------------------------------------------- согласия (ПДн)
+
+
+async def get_consent(user_id: int) -> dict | None:
+    """Текущая зафиксированная версия согласия юзера (или None)."""
+    assert _db is not None
+    cur = await _db.execute("SELECT * FROM consents WHERE user_id=?", (user_id,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def record_consent(user_id: int, version: str) -> str:
+    """Фиксирует согласие юзера на версию политики. Возвращает ISO-таймстамп."""
+    assert _db is not None
+    ts = _now()
+    await _db.execute(
+        "INSERT INTO consents (user_id, version, created_at) VALUES (?,?,?)"
+        " ON CONFLICT(user_id) DO UPDATE SET version=excluded.version,"
+        " created_at=excluded.created_at",
+        (user_id, version, ts),
+    )
+    await _db.commit()
+    return ts

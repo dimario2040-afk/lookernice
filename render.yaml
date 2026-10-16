@@ -39,3 +39,8 @@ services:
         sync: false
       - key: WEBHOOK_SECRET
         generateValue: true
+      # Юр. слой (/legal): оператор персональных данных и контакт поддержки
+      - key: LEGAL_OPERATOR
+        sync: false
+      - key: LEGAL_CONTACT
+        sync: false

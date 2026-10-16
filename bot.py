@@ -734,7 +734,8 @@ async def cmd_help(msg: Message) -> None:
         "⚔️ Бател: ответь на сообщение и напиши /mog — или /mog без ответа "
         "(открытый вызов, кто примет кнопкой).\n"
         "🏆 Арена до 8: /arena в группе.\n"
-        "🎒 Артефакты в бою: за Stars, буст до +0.5 (есть 🎁 бесплатный раз в день).",
+        "🎒 Артефакты в бою: за Stars, буст до +0.5 (есть 🎁 бесплатный раз в день).\n"
+        "🔞 18+ · правила и согласие на обработку данных — /legal",
     )
 
 
@@ -1525,9 +1526,83 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str) -> bytes:
 
 
 @dp.message(F.photo)
+@dp.message(Command("legal", "privacy", "consent"))
+async def cmd_legal(msg: Message) -> None:
+    """Правила и согласие на обработку данных (дублирует веб-страницу)."""
+    from game import legal as mog_legal
+
+    link = (
+        f'\n\n📄 Полный текст: <a href="{PUBLIC_BASE_URL}/legal">{PUBLIC_BASE_URL}/legal</a>'
+        if PUBLIC_BASE_URL
+        else ""
+    )
+    await msg.answer(
+        "📄 <b>Правила и согласие</b>\n\n" + mog_legal.consent_short() + link,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def _ensure_consent(msg: Message, bot: Bot) -> bool:
+    """Согласие на обработку ПДн (152-ФЗ). Нет/устарело → шлёт запрос и False."""
+    from game import db as mog_db
+    from game import legal as mog_legal
+
+    row = await mog_db.get_consent(msg.from_user.id)
+    if row and row["version"] == mog_legal.POLICY_VERSION:
+        return True
+    link = (
+        f'\n\n📄 Полный текст: <a href="{PUBLIC_BASE_URL}/legal">правила и согласие</a>'
+        if PUBLIC_BASE_URL
+        else ""
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Мне 18+, принимаю",
+                    callback_data=f"consent:{mog_legal.POLICY_VERSION}",
+                )
+            ]
+        ]
+    )
+    await msg.answer(
+        "🔞 <b>Прежде чем считать тебя — нужно согласие</b>\n\n"
+        + mog_legal.consent_short()
+        + link,
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    return False
+
+
+@dp.callback_query(F.data.startswith("consent:"))
+async def on_consent(cb: CallbackQuery) -> None:
+    """Фиксация согласия на обработку ПДн (с версией политики и таймстампом)."""
+    from game import db as mog_db
+
+    version = (cb.data or "").split(":", 1)[-1]
+    ts = await mog_db.record_consent(cb.from_user.id, version)
+    await cb.answer("Согласие зафиксировано ✅")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001 — старое/неизменное сообщение
+        pass
+    await cb.message.answer(
+        f"✅ <b>Согласие зафиксировано</b> (политика v{version}, {ts}).\n"
+        "Теперь кидай фото 👇",
+        parse_mode="HTML",
+    )
+
+
 async def on_photo(msg: Message, bot: Bot) -> None:
     if not TELEGRAM_TOKEN or not MODEL_API_KEY:
         await msg.answer("⚠️ Бот не настроен: нет TELEGRAM_TOKEN или MODEL_API_KEY в .env")
+        return
+
+    # 🔞 Без согласия на обработку ПДн фото не обрабатываем.
+    if not await _ensure_consent(msg, bot):
         return
 
     status = await msg.answer(
@@ -1779,6 +1854,18 @@ async def main() -> None:
             return web.Response(text="ok")
 
         app.router.add_get("/", health)  # для Render health-check и cron-job.org анти-сна
+
+        # 📄 Юридическая страница: согласие на обработку ПДн / правила / 18+.
+        async def legal_page(_request: object) -> object:
+            from game import legal as mog_legal
+
+            return web.Response(
+                text=mog_legal.page_html(base_url=PUBLIC_BASE_URL),
+                content_type="text/html",
+            )
+
+        for _path in ("/legal", "/privacy", "/terms", "/consent"):
+            app.router.add_get(_path, legal_page)
         SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=secret).register(
             app, path=hook_path
         )
