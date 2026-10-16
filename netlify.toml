@@ -1,0 +1,32 @@
+# Netlify — статика MOG (страница согласия/правил + лендинг).
+# Бот тут НЕ живёт (serverless) — он на Render (webhook). Netlify даёт вечный
+# бесплатный адрес для /legal (не засыпает, CDN, быстрый).
+#
+# Деплой:
+#   1) python tools/build_netlify.py      (собрать netlify/public)
+#   2) npx netlify-cli deploy --dir=netlify/public --prod   (или drag&drop папки)
+[build]
+  publish = "netlify/public"
+  command = "python tools/build_netlify.py"
+
+[[redirects]]
+  from = "/privacy"
+  to = "/legal/"
+  status = 301
+
+[[redirects]]
+  from = "/terms"
+  to = "/legal/"
+  status = 301
+
+[[redirects]]
+  from = "/consent"
+  to = "/legal/"
+  status = 301
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"

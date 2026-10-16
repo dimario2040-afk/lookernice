@@ -1579,6 +1579,24 @@ async def _ensure_consent(msg: Message, bot: Bot, intro: str = "") -> bool:
             ]
         ]
     )
+    # В группе НЕ вываливаем простыню (это спамит чат) — короткий один-тап.
+    if msg.chat.type != "private":
+        rules = (
+            f' (<a href="{PUBLIC_BASE_URL}/legal">правила</a>)'
+            if PUBLIC_BASE_URL
+            else " (подробнее — /legal)"
+        )
+        await msg.answer(
+            "🔞 <b>Один тап — и считаю твой МОГ.</b>\n"
+            "Подтверди, что тебе 18+ и ты согласен на обработку фото для игры"
+            + rules
+            + "\n\n<i>Дальше просто кинь фото ещё раз.</i>",
+            reply_markup=kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return False
+    # Личка — полный текст согласия.
     await msg.answer(
         intro
         + "🔞 <b>Прежде чем считать тебя — нужно согласие</b>\n\n"
@@ -1874,6 +1892,7 @@ async def main() -> None:
             return web.Response(text="ok")
 
         app.router.add_get("/", health)  # для Render health-check и cron-job.org анти-сна
+        app.router.add_get("/healthz", health)
 
         # 📄 Юридическая страница: согласие на обработку ПДн / правила / 18+.
         async def legal_page(_request: object) -> object:
@@ -1923,6 +1942,25 @@ async def main() -> None:
             )
         except Exception:  # noqa: BLE001 — кнопка не критична
             log.warning("set_chat_menu_button не удалось", exc_info=True)
+
+        # 🔁 Анти-сон: free-тариф Render усыпляет web-сервис после ~15 мин без
+        # ВХОДЯЩИХ запросов (исходящий long-poll не считается). Раз в 10 минут
+        # пингуем собственный публичный URL → входящий трафик → инстанс не спит.
+        async def _keepalive() -> None:
+            import aiohttp
+
+            url = f"{PUBLIC_BASE_URL}/healthz"
+            await asyncio.sleep(120)  # дать сервису подняться
+            while True:
+                try:
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(url, timeout=aiohttp.ClientTimeout(total=25)) as r:
+                            log.info("keep-alive %s -> %s", url, r.status)
+                except Exception:  # noqa: BLE001 — пинг не должен ронять бота
+                    log.warning("keep-alive ping не удался", exc_info=True)
+                await asyncio.sleep(600)
+
+        asyncio.create_task(_keepalive())
 
         await asyncio.Event().wait()  # висим вечно
     else:
