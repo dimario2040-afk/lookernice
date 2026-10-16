@@ -421,7 +421,13 @@ def _vision_chat(messages: list, *, max_tokens: int, temperature: float = 0.9):
     last_exc: Exception | None = None
     busy = True  # если всё упало только на 429/сеть — это внешняя перегрузка, не наш баг
     for label, base_url, model in targets:
-        client = OpenAI(api_key=os.getenv(_vlm_key_env(label), ""), base_url=base_url)
+        # max_retries=0: ретраями управляем сами (иначе клиент утроит нагрузку:
+        # 3 наших попытки × N внутренних = шторм по и так перегруженной модели).
+        client = OpenAI(
+            api_key=os.getenv(_vlm_key_env(label), ""),
+            base_url=base_url,
+            max_retries=0,
+        )
         for attempt in range(3):
             try:
                 return client.chat.completions.create(
