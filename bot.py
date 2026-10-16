@@ -804,6 +804,22 @@ async def cmd_mog(msg: Message) -> None:
     await msg.reply(text, reply_markup=kb, parse_mode="HTML")
 
 
+def _card_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки под МОГ-карточкой (используются и в реролле)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⚔️ Дуэль 1×1", callback_data="duel_new"),
+                InlineKeyboardButton(text="🏆 Общий баттл", callback_data="arena_quick"),
+            ],
+            [InlineKeyboardButton(text="🔄 Ещё раз — 15 ⭐", callback_data="reroll")],
+            [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
+            [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
+            [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
+        ]
+    )
+
+
 def _duel_keyboard(battle_id: int, *, open_challenge: bool):
     """Кнопка принятия вызова (чат). Для адресного — плюс мини-апп, если есть URL."""
     rows = [
@@ -1212,6 +1228,56 @@ async def on_buy(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer(PUBLIC_ERROR, show_alert=True)
 
 
+# ------------------------------------------------------- платный реролл (15 ⭐)
+@dp.callback_query(F.data == "reroll")
+async def on_reroll(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка под карточкой: платный реролл ТОГО ЖЕ фото (байты из памяти)."""
+    from game import payments
+
+    if cb.from_user.id not in _pending_full:
+        await cb.answer("📸 Фото уже вышло из памяти — просто кинь его заново.", show_alert=True)
+        return
+    try:
+        await payments.send_invoice(bot, cb.message.chat.id, "reroll", cb.from_user.id)
+        await cb.answer("Счёт на реролл отправлен ⭐")
+    except Exception:  # noqa: BLE001
+        log.exception("reroll invoice failed")
+        await cb.answer(PUBLIC_ERROR, show_alert=True)
+
+
+async def _do_reroll(msg: Message, user_id: int) -> None:
+    """После оплаты: пересчитать то же фото новым роллом и выдать новую печать."""
+    from game import rolls as mog_rolls
+
+    data = _pending_full.get(user_id)
+    if not data:
+        await msg.answer(
+            "🔄 Реролл оплачен, но фото уже вышло из памяти. Кинь его заново — пересчёт бесплатный.",
+            parse_mode="HTML",
+        )
+        return
+    raw = data[0]
+    prev = round(mog_rolls.base_score(raw), 4)
+    r = mog_rolls.roll(raw)  # новый шум/крит поверх той же базы
+    score, tier = r["score"], r["tier"]
+    arrow = "📈" if score > prev else ("📉" if score < prev else "➡️")
+    try:
+        card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
+        await msg.answer_photo(
+            BufferedInputFile(card, filename="mog_card.jpg"),
+            caption=(
+                f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
+                f"🔄 Реролл: было {prev:.4f} → стало <b>{score:.4f}</b> {arrow}\n\n"
+                + _legal_micro()
+            ),
+            parse_mode="HTML",
+            reply_markup=_card_keyboard(),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("reroll card failed")
+        await msg.answer(f"🔄 Реролл: было {prev:.4f} → стало {score:.4f} ({tier})")
+
+
 @dp.pre_checkout_query()
 async def on_pre_checkout(q: PreCheckoutQuery, bot: Bot) -> None:
     from game import payments
@@ -1221,11 +1287,15 @@ async def on_pre_checkout(q: PreCheckoutQuery, bot: Bot) -> None:
 
 
 @dp.message(F.successful_payment)
-async def on_paid(msg: Message) -> None:
+async def on_paid(msg: Message, bot: Bot) -> None:
     from game import payments
 
     sp = msg.successful_payment
     product = await payments.grant(sp.invoice_payload)
+    product_key, paid_uid, _extras = payments.parse_payload(sp.invoice_payload)
+    if product_key == "reroll" and paid_uid:
+        await _do_reroll(msg, paid_uid)
+        return
     if product:
         await msg.answer(
             f"✅ Оплачено: <b>{product['title']}</b> ({sp.total_amount} ⭐)\n"
@@ -1646,17 +1716,7 @@ async def on_photo(msg: Message, bot: Bot) -> None:
     # и кнопки не должны зависеть от нейронки (она может быть на 429).
     metrics = {"face_found": False, "error": "biometry_unavailable"}
     metrics_text = format_metrics(metrics)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="⚔️ Дуэль 1×1", callback_data="duel_new"),
-                InlineKeyboardButton(text="🏆 Общий баттл", callback_data="arena_quick"),
-            ],
-            [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
-            [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
-            [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
-        ]
-    )
+    kb = _card_keyboard()
     try:
         photo = msg.photo[-1]  # самое большое разрешение
         tg_file = await bot.get_file(photo.file_id)

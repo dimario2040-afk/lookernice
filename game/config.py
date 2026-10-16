@@ -65,4 +65,6 @@ STARS_CATALOG = {
     "rolls_100": {"title": "Reroll x100", "stars": 299, "rolls": 100},
     "crit_token": {"title": "Крит-токен", "stars": 49, "crit": 1},
     "second_chance": {"title": "Второй шанс", "stars": 15, "rolls": 1},
+    # Реролл того же фото прямо под карточкой (та же база, новый шум/крит).
+    "reroll": {"title": "🔄 Ещё раз (реролл)", "stars": 15, "reroll": 1},
 }
