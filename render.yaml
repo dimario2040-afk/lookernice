@@ -26,5 +26,10 @@ services:
         sync: false
       - key: MODEL_API_KEY
         sync: false
+      # водопад: добавь любой из этих ключей — провайдер включится сам
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
       - key: WEBHOOK_SECRET
         generateValue: true

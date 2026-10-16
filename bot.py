@@ -46,15 +46,17 @@ MODEL_API_KEY = os.getenv("MODEL_API_KEY", "")
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 MODEL_NAME = os.getenv("MODEL_NAME", "glm-4.6v-flash")
 
-# Free vision-модели по приоритету. На z.ai единственная бесплатная vision —
-# glm-4.6v-flash (glm-4.6v/4.5v платные, прочие имена не существуют).
-# Переопределяется env MODEL_FALLBACKS (через запятую) под другой провайдер.
+# Водопад бесплатных VLM. Тайминги: одна попытка = VLM_TIMEOUT сек, весь бюджет
+# на одно фото = VLM_DEADLINE сек. Без sleep-пауз — иначе отказ «зависает».
+VLM_TIMEOUT = float(os.getenv("VLM_TIMEOUT", "12"))
+VLM_DEADLINE = float(os.getenv("VLM_DEADLINE", "30"))
+
+# Доп. модели основного провайдера (z.ai) через запятую. Переопределяется env.
 MODEL_FALLBACKS = [
     m.strip()
     for m in os.getenv("MODEL_FALLBACKS", "glm-4.6v-flash").split(",")
     if m.strip()
 ]
-MODEL_CANDIDATES = [MODEL_NAME] + [m for m in MODEL_FALLBACKS if m != MODEL_NAME]
 
 # Публичный HTTPS-URL (Render задаёт RENDER_EXTERNAL_URL; PUBLIC_URL — для прочего
 # хостинга). Нужен для Mini App и webhook. Пусто = локальный polling без мини-аппа.
@@ -297,14 +299,42 @@ lower third, bigonial width, zygos, anti-fraud (ракурс/свет), softmaxx
 """
 
 # ---------------------------------------------------------------- мозги (VLM)
-# ─────────────────── ПРОВАЙДЕРЫ VLM (заменяемые) ───────────────────
-# Список провайдеров с их env-именами. Любой можно заменить/добавить, не трогая код.
-# Формат: (label, base_url_env, key_env, models_csv). Поддерживает несколько моделей.
+# ─────────────────── ПРОВАЙДЕРЫ VLM (заменяемые, «водопад») ───────────────────
+# Порядок = приоритет. Первый живой отдаёт ответ, остальные — резерв.
+# Формат: (label, base_url, key_env, models_csv)
+#   base_url — готовый URL (с "://") ИЛИ имя ENV-переменной с URL.
+# Если ключа провайдера нет — он тихо пропускается (включается позже без правок кода).
 _VLM_PROVIDERS = [
-    # Уже legacy: MODEL_BASE_URL имеет дефолт, MODEL_API_KEY берётся из .env,
-    # MODEL_NAME с дефолтом. Поэтому ключи жёстко НЕ пустые — target всегда есть.
-    ("zhipu", None, "MODEL_API_KEY", None),  # None => подставить MODEL_NAME
+    # 1) Google AI Studio — бесплатный тир, лучшая бесплатная vision, без карты.
+    #    ВАЖНО: Google блокирует API по региону — из РФ не работает, но на Render
+    #    (Frankfurt) доступен. Недоступный регион авто-выключаем (см. _VLM_DISABLED).
+    (
+        "gemini",
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "GEMINI_API_KEY",
+        "gemini-3.8-flash,gemini-flash-latest",
+    ),
+    # 2) z.ai / Zhipu — уже настроен (MODEL_API_KEY). glm-4.6v-flash — единственная
+    #    бесплатная vision, часто 429 → запрос уходит дальше по водопаду.
+    (
+        "zhipu",
+        MODEL_BASE_URL,
+        "MODEL_API_KEY",
+        ",".join(dict.fromkeys([MODEL_NAME] + MODEL_FALLBACKS)),
+    ),
+    # 3) OpenRouter — один ключ, пачка бесплатных vision-моделей, без карты.
+    (
+        "openrouter",
+        "https://openrouter.ai/api/v1",
+        "OPENROUTER_API_KEY",
+        "google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,thinkingmachines/inkling:free",
+    ),
 ]
+
+
+# Провайдеры, которые отвалились необратимо (битый ключ, блок региона) — чтобы
+# не тратить время на них в каждом следующем запросе. Сбрасывается при рестарте.
+_VLM_DISABLED: set[str] = set()
 
 
 def _vlm_key_env(label: str) -> str:
@@ -316,36 +346,26 @@ def _vlm_key_env(label: str) -> str:
 
 
 def _vlm_targets() -> list[tuple[str, str, str]]:
-    """Собирает (label, base_url, model) по всем провайдерам с непустыми ключами.
+    """Собирает упорядоченный водопад (label, base_url, model).
 
-    У каждого провайдера свой env с ключом и URL (можно разделить, если несколько).
-    Поддерживается MODEL_FALLBACKS — дописывается как дополнительные цели.
+    Провайдер попадает в список только если задан его ключ и URL. Порядок =
+    порядок _VLM_PROVIDERS, внутри провайдера — порядок моделей в models_csv.
     """
     targets: list[tuple[str, str, str]] = []
-
-    # legacy-путь: основной провайдер на MODEL_API_KEY + MODEL_BASE_URL + MODEL_NAME.
-    if MODEL_API_KEY and MODEL_BASE_URL:
-        targets.append(("zhipu", MODEL_BASE_URL, MODEL_NAME))
-
-    # доп. провайдеры: формат "label|url_env|key_env|models,через,запятую"
-    for label, url_env, key_env, models_csv in _VLM_PROVIDERS:
-        if key_env is None:
-            continue
+    seen: set[tuple[str, str, str]] = set()
+    for label, base, key_env, models_csv in _VLM_PROVIDERS:
+        url = base.strip() if "://" in base else os.getenv(base, "").strip()
         key = os.getenv(key_env, "").strip()
-        base = os.getenv(url_env, "", "").strip() if url_env else ""
-        if not key or not base:
+        if not key or not url:
             continue
-        for model in (m.strip() for m in models_csv.split(",")):
-            if model:
-                targets.append((label, base, model))
-
-    # явный MODEL_FALLBACKS (на других провайдерах — просто список моделей)
-    if targets:
-        base = targets[0][1]
-        for model in MODEL_FALLBACKS:
-            if model and model not in (t[2] for t in targets):
-                targets.append(("zhipu", base, model))
-
+        for model in (m.strip() for m in (models_csv or "").split(",")):
+            if not model:
+                continue
+            sig = (label, url, model)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            targets.append(sig)
     return targets
 
 
@@ -399,10 +419,11 @@ def _extract_roast(resp, fallback_hint: str = "") -> str:
 
 
 def _vision_chat(messages: list, *, max_tokens: int, temperature: float = 0.9):
-    """Вызов VLM с авто-фолбэком по провайдерам и ретраями на 429/5xx.
+    """ВОДОПАД: перебирает провайдеров по приоритету, пока кто-нибудь не ответит.
 
-    z.ai free-модели периодически отвечают 429 (code 1305, «перегружено») —
-    short retry + переход к следующему провайдеру/модели, чтобы юзер получал ответ.
+    Без sleep-пауз и без ретраев одной модели: упал/занят — сразу следующий
+    провайдер. На одну попытку VLM_TIMEOUT сек, на всё фото VLM_DEADLINE сек.
+    Так отказ всегда быстрый, а не «зависает» на минуту.
     """
     import time
 
@@ -416,48 +437,65 @@ def _vision_chat(messages: list, *, max_tokens: int, temperature: float = 0.9):
 
     targets = _vlm_targets()
     if not targets:
-        raise RuntimeError("NO_VLM_PROVIDER: не задано ни одного VLM-провайдера (нужны MODEL_API_KEY/MODEL_BASE_URL)")
+        raise RuntimeError(
+            "NO_VLM_PROVIDER: не задано ни одного VLM-провайдера "
+            "(нужен ключ: GEMINI_API_KEY / MODEL_API_KEY / OPENROUTER_API_KEY)"
+        )
 
+    deadline = time.monotonic() + VLM_DEADLINE
     last_exc: Exception | None = None
-    busy = True  # если всё упало только на 429/сеть — это внешняя перегрузка, не наш баг
+    busy = True  # всё упало на 429/сеть => это внешняя перегрузка, не наш баг
     for label, base_url, model in targets:
-        # max_retries=0: ретраями управляем сами (иначе клиент утроит нагрузку:
-        # 3 наших попытки × N внутренних = шторм по и так перегруженной модели).
+        if label in _VLM_DISABLED:
+            continue  # провайдер уже отработал необратимую ошибку — не тратим время
+        if time.monotonic() >= deadline:
+            log.warning("водопад: бюджет %.0fс исчерпан", VLM_DEADLINE)
+            break
         client = OpenAI(
             api_key=os.getenv(_vlm_key_env(label), ""),
             base_url=base_url,
             max_retries=0,
+            timeout=VLM_TIMEOUT,
         )
-        for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            log.info("водопад: ответ от %s/%s", label, model)
+            return resp
+        except RateLimitError as exc:
+            last_exc = exc
+            busy = True
+            log.warning("[%s] %s 429 (перегруз) → следующий", label, model)
+        except (APIConnectionError, APITimeoutError) as exc:
+            last_exc = exc
+            busy = True
+            log.warning("[%s] %s сеть/timeout → следующий", label, model)
+        except APIStatusError as exc:
+            last_exc = exc
+            code = getattr(exc, "status_code", 0)
+            busy = code >= 500
+            body = ""
             try:
-                return client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-            except (RateLimitError, APIConnectionError, APITimeoutError) as exc:
-                last_exc = exc
-                busy = True
-                log.warning("[%s] %s try %d: %s", label, model, attempt + 1, str(exc)[:110])
-                time.sleep(min(6.0, 1.5 * (attempt + 1)))
-            except APIStatusError as exc:
-                last_exc = exc
-                if getattr(exc, "status_code", 0) >= 500:
-                    busy = True
-                    log.warning("[%s] %s 5xx try %d: %s", label, model, attempt + 1, str(exc)[:110])
-                    time.sleep(1.5 * (attempt + 1))
-                else:
-                    busy = False
-                    log.warning("[%s] %s %s: %s", label, model, exc.status_code, str(exc)[:110])
-                    break  # 4xx кроме 429 — сразу к след. провайдеру/модели
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                busy = False
-                log.warning("[%s] %s err: %s", label, model, str(exc)[:110])
-                break
+                body = (exc.response.text or "").lower()
+            except Exception:  # noqa: BLE001
+                body = str(exc).lower()
+            # необратимые ошибки: блок региона / плохой ключ → выключаем провайдера
+            if code in (401, 403) or "location is not supported" in body:
+                _VLM_DISABLED.add(label)
+                log.warning("[%s] необратимо недоступен (HTTP %s) → выключаю", label, code)
+            else:
+                log.warning("[%s] %s HTTP %s → следующий", label, model, code)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            busy = False
+            log.warning("[%s] %s err: %s", label, model, str(exc)[:110])
+
     if busy:
-        raise RuntimeError("MODEL_BUSY: бесплатная vision-модель перегружена (429/1305)")
+        raise RuntimeError("MODEL_BUSY: все бесплатные vision-модели перегружены (429/5xx)")
     if last_exc:
         raise last_exc
     raise RuntimeError("нет доступной VLM-модели")
