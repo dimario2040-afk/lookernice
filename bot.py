@@ -1433,6 +1433,16 @@ def spots_caption(items: list) -> str:
 # Возвращает то же фото с неон-штампом «МОГ <балл> · тир» в углу — для репоста.
 
 
+def _legal_micro() -> str:
+    """Микро-строка согласия для подписи карточки (видно при каждом действии)."""
+    if PUBLIC_BASE_URL:
+        return (
+            '🔞 18+ · отправляя фото, ты согласен с '
+            f'<a href="{PUBLIC_BASE_URL}/legal">правилами</a>'
+        )
+    return "🔞 18+ · отправляя фото, ты согласен с /legal"
+
+
 def _load_font(size: int):
     """Кириллический шрифт: сперва наш в репо, потом системные, потом дефолт."""
     from PIL import ImageFont
@@ -1686,7 +1696,10 @@ async def on_photo(msg: Message, bot: Bot) -> None:
             card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
             await msg.answer_photo(
                 BufferedInputFile(card, filename="mog_card.jpg"),
-                caption=f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n😏 Печать стоит — кинь другу",
+                caption=(
+                    f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
+                    "😏 Печать стоит — кинь другу\n\n" + _legal_micro()
+                ),
                 parse_mode="HTML",
             )
         except Exception:  # noqa: BLE001
@@ -1719,7 +1732,10 @@ async def on_photo(msg: Message, bot: Bot) -> None:
                 card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
                 await msg.answer_photo(
                     BufferedInputFile(card, filename="mog_card.jpg"),
-                    caption=f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n😏 Печать стоит — кинь другу",
+                    caption=(
+                    f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
+                    "😏 Печать стоит — кинь другу\n\n" + _legal_micro()
+                ),
                     parse_mode="HTML",
                 )
                 await msg.answer(
