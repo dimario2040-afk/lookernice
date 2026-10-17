@@ -27,6 +27,9 @@ except ImportError:
     BIOMETRY_AVAILABLE = False
 import numpy as np
 from aiogram import Bot, Dispatcher, F
+
+# Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
+APP_VERSION = "2026-10-17a-stampfix"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -1840,6 +1843,35 @@ def _arena_board_image(players: list[dict]) -> bytes | None:
     return out.getvalue()
 
 
+async def _send_mog_card(msg: Message, raw: bytes, score: float, tier: str) -> bool:
+    """Шлёт фото с печатью «МОГ».
+
+    Печать рисуется Pillow'ом; если он недоступен (или сломан) — шлём ИСХОДНОЕ фото
+    с тем же подписью-баллом. Принцип: юзер ВСЕГДА получает картинку, даже если
+    красивость не удалась. Вернёт True, если ушла именно печатная карточка.
+    """
+    caption = (
+        f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
+        "😏 Печать стоит — кинь другу\n\n" + _legal_micro()
+    )
+    card: bytes | None = None
+    try:
+        card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
+    except Exception:  # noqa: BLE001 — без PIL печать недоступна, но фото отправим
+        log.exception("stamp failed — отправляю фото без печати")
+    try:
+        await msg.answer_photo(
+            BufferedInputFile(card or raw, filename="mog_card.jpg"),
+            caption=caption,
+            parse_mode="HTML",
+        )
+        return card is not None
+    except Exception:  # noqa: BLE001 — крайний случай: картинка не ушла вовсе
+        log.exception("answer_photo failed")
+        await msg.answer(caption, parse_mode="HTML")
+        return False
+
+
 def _mog_stamp(photo_bytes: bytes, score: float, tier: str) -> bytes:
     """Фото + неон-печать «МОГ <балл> · тир» в правом нижнем углу (JPEG bytes)."""
     from PIL import Image, ImageDraw, ImageFilter
@@ -2097,18 +2129,7 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes) -> None:
         mog_line = _mog_tag(raw, score, tier)
 
         # Печать «МОГ» на фото — готово к репосту. Не роняем разбор, если не нарисуется.
-        try:
-            card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
-            await msg.answer_photo(
-                BufferedInputFile(card, filename="mog_card.jpg"),
-                caption=(
-                    f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
-                    "😏 Печать стоит — кинь другу\n\n" + _legal_micro()
-                ),
-                parse_mode="HTML",
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("stamp failed")
+        await _send_mog_card(msg, raw, score, tier)
 
         if simple:
             # Футер-вирус: подталкиваем переслать другу (ретеншн).
@@ -2134,23 +2155,15 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes) -> None:
             try:
                 score, tier = _mog_score_tier(raw)
                 _remember_photo(msg.from_user.id, raw, metrics_text, metrics)
-                card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
-                await msg.answer_photo(
-                    BufferedInputFile(card, filename="mog_card.jpg"),
-                    caption=(
-                    f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
-                    "😏 Печать стоит — кинь другу\n\n" + _legal_micro()
-                ),
-                    parse_mode="HTML",
-                )
+                sent_card = await _send_mog_card(msg, raw, score, tier)
                 await msg.answer(
                     _friendly_error(exc) + "\nПечать твоя 👆 Кнопки ниже живут без нейронки.",
                     reply_markup=kb,
                     parse_mode="HTML",
                 )
-                sent_card = True
             except Exception:  # noqa: BLE001
                 log.exception("fallback card failed")
+                sent_card = False
         if not sent_card:
             await msg.answer(_friendly_error(exc) + "\nПопробуй другое фото.")
         try:
@@ -2276,7 +2289,14 @@ async def main() -> None:
         app = web.Application()
 
         async def health(_request: object) -> object:
-            return web.Response(text="ok")
+            # Диагностика деплоя: pil=false -> печать «МОГ» и картинки не рисуются.
+            try:
+                import PIL  # noqa: F401, PLC0415
+
+                pil = True
+            except Exception:  # noqa: BLE001
+                pil = False
+            return web.json_response({"ok": True, "pil": pil, "ver": APP_VERSION})
 
         app.router.add_get("/", health)  # для Render health-check и cron-job.org анти-сна
         app.router.add_get("/healthz", health)
