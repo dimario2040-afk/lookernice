@@ -1325,8 +1325,7 @@ async def _do_reroll(msg: Message, user_id: int) -> None:
             BufferedInputFile(card, filename="mog_card.jpg"),
             caption=(
                 f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
-                f"🔄 Реролл: было {prev:.4f} → стало <b>{score:.4f}</b> {arrow}\n\n"
-                + _legal_micro()
+                f"🔄 Реролл: было {prev:.4f} → стало <b>{score:.4f}</b> {arrow}"
             ),
             parse_mode="HTML",
             reply_markup=await _card_keyboard_for(user_id),
@@ -1376,8 +1375,7 @@ async def _do_studio(msg: Message, user_id: int) -> None:
             BufferedInputFile(card, filename="mog_studio.jpg"),
             caption=(
                 f"🎨 <b>MOG STUDIO · {score:.4f} · {tier}</b>\n"
-                "Ретушь + золотая рамка. Чистая ванити — балл не менялся.\n\n"
-                + _legal_micro()
+                "Ретушь + золотая рамка. Чистая ванити — балл не менялся."
             ),
             parse_mode="HTML",
             reply_markup=await _card_keyboard_for(user_id),
@@ -1459,7 +1457,7 @@ async def _send_gift(msg: Message, product: dict) -> None:
     await msg.answer(
         f"🎁 <b>Подарок готов: {label}</b>\n\n"
         "Перешли это сообщение другу — кто первый нажмёт «Забрать», "
-        "тому подарок и достанется.\n\n" + _legal_micro(),
+        "тому подарок и достанется.",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -1696,16 +1694,6 @@ def spots_caption(items: list) -> str:
 # Возвращает то же фото с неон-штампом «МОГ <балл> · тир» в углу — для репоста.
 
 
-def _legal_micro() -> str:
-    """Микро-строка согласия для подписи карточки (видно при каждом действии)."""
-    if PUBLIC_BASE_URL:
-        return (
-            '🔞 18+ · отправляя фото, ты согласен с '
-            f'<a href="{PUBLIC_BASE_URL}/legal">правилами</a>'
-        )
-    return "🔞 18+ · отправляя фото, ты согласен с /legal"
-
-
 def _load_font(size: int):
     """Кириллический шрифт: сперва наш в репо, потом системные, потом дефолт."""
     from PIL import ImageFont
@@ -1852,7 +1840,7 @@ async def _send_mog_card(msg: Message, raw: bytes, score: float, tier: str) -> b
     """
     caption = (
         f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
-        "😏 Печать стоит — кинь другу\n\n" + _legal_micro()
+        "😏 Печать стоит — кинь другу"
     )
     card: bytes | None = None
     try:
@@ -1997,18 +1985,19 @@ async def _ensure_consent(msg: Message, bot: Bot, intro: str = "") -> bool:
             "🔞 <b>Один тап — и считаю твой МОГ.</b>\n"
             "Подтверди, что тебе 18+ и ты согласен на обработку фото для игры"
             + rules
-            + "\n\n<i>Дальше просто кинь фото ещё раз.</i>",
+            + "\n\n<i>Спросим один раз — дальше просто кидай фото.</i>",
             reply_markup=kb,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
         return False
-    # Личка — полный текст согласия.
+    # Личка — полный текст согласия (тоже один раз: дальше только по /legal).
     await msg.answer(
         intro
         + "🔞 <b>Прежде чем считать тебя — нужно согласие</b>\n\n"
         + mog_legal.consent_short()
-        + link,
+        + link
+        + "\n\n<i>Спрошу один раз. Потом просто кидай фото 👇</i>",
         reply_markup=kb,
         parse_mode="HTML",
         disable_web_page_preview=True,
