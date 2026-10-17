@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -114,6 +114,24 @@ CREATE TABLE IF NOT EXISTS gift_tokens (
     created_at TEXT NOT NULL DEFAULT '',
     claimed_by INTEGER
 );
+
+-- ⚔️ Дуэли по ссылке (без группы): вызывающий шлёт t.me-ссылку, соперник жмёт
+-- и попадает в личку к боту. Живут отдельно от battles, т.к. чата у них нет —
+-- итог бот пишет обоим в личку.
+CREATE TABLE IF NOT EXISTS duel_links (
+    code            TEXT PRIMARY KEY,
+    challenger_id   INTEGER NOT NULL,
+    challenger_name TEXT    NOT NULL DEFAULT '',
+    challenger_score REAL   NOT NULL DEFAULT 0,
+    status          TEXT    NOT NULL DEFAULT 'open',  -- open|accepted|done|expired
+    opponent_id     INTEGER,
+    opponent_name   TEXT    NOT NULL DEFAULT '',
+    opponent_score  REAL    NOT NULL DEFAULT 0,
+    winner_id       INTEGER,
+    created_at      TEXT    NOT NULL DEFAULT '',
+    expires_at      TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_duel_links_status ON duel_links(status, expires_at);
 """
 
 
@@ -631,3 +649,79 @@ async def claim_gift_token(token: str, user_id: int) -> tuple[bool, str, str]:
         return False, row["kind"], "used"
     await add_credit(user_id, row["kind"], 1)
     return True, row["kind"], "ok"
+
+
+# ------------------------------------------------- ????? ?? ?????? (duel_links)
+
+
+async def create_duel_link(
+    code: str, challenger_id: int, challenger_name: str, challenger_score: float, ttl_hours: int
+) -> None:
+    """??????? ????? ?? ??????. ???? ??????????? ??????????? ?? ?????? ??????."""
+    assert _db is not None
+    expires = (
+        datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
+    ).isoformat(timespec="seconds")
+    await _db.execute(
+        "INSERT INTO duel_links (code, challenger_id, challenger_name, challenger_score,"
+        " status, created_at, expires_at) VALUES (?,?,?,?,'open',?,?)",
+        (code, challenger_id, challenger_name, challenger_score, _now(), expires),
+    )
+    await _db.commit()
+
+
+async def get_duel_link(code: str) -> dict | None:
+    assert _db is not None
+    cur = await _db.execute("SELECT * FROM duel_links WHERE code=?", (code,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def accept_duel_link(code: str, user_id: int, user_name: str) -> tuple[bool, str]:
+    """???????? ????????? ?????. ?????????? (ok, reason)."""
+    assert _db is not None
+    cur = await _db.execute(
+        "UPDATE duel_links SET status='accepted', opponent_id=?, opponent_name=?"
+        " WHERE code=? AND status='open' AND opponent_id IS NULL",
+        (user_id, user_name, code),
+    )
+    await _db.commit()
+    return (cur.rowcount > 0), ("ok" if cur.rowcount > 0 else "closed")
+
+
+async def resolve_duel_link(code: str, opponent_score: float, winner_id: int | None) -> None:
+    assert _db is not None
+    await _db.execute(
+        "UPDATE duel_links SET status='done', opponent_score=?, winner_id=? WHERE code=?",
+        (opponent_score, winner_id, code),
+    )
+    await _db.commit()
+
+
+async def pending_duel_link_for(user_id: int) -> dict | None:
+    """????????, ?? ?? ??????????? ????? ????? ????? ? ???? ??? ????."""
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT * FROM duel_links WHERE opponent_id=? AND status='accepted'"
+        " ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def expire_duel_links() -> list[dict]:
+    """????? ???????????? ??????. ?????????? ?????????? ??? ???????????."""
+    assert _db is not None
+    now = _now()
+    cur = await _db.execute(
+        "SELECT * FROM duel_links WHERE status='open' AND expires_at<?", (now,)
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    if not rows:
+        return []
+    await _db.execute(
+        "UPDATE duel_links SET status='expired' WHERE status='open' AND expires_at<?", (now,)
+    )
+    await _db.commit()
+    return rows

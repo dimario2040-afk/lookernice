@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-17a-stampfix"
+APP_VERSION = "2026-10-17b-duellink"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -727,10 +727,19 @@ def _stash_consent_photo(user_id: int, raw: bytes) -> None:
 
 # ---------------------------------------------------------------- бот
 dp = Dispatcher()
+BOT_ME_ID: int | None = None
+_BOT_USERNAME = ""
 
 
 @dp.message(Command("start"))
 async def cmd_start(msg: Message, bot: Bot) -> None:
+    # ⚔️ Deep-link вызов: /start duel_<код> — сразу показываем вызов, без приветствия.
+    parts = (msg.text or "").split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+    if payload.startswith("duel_"):
+        await _start_duel_invite(msg, bot, payload[len("duel_"):])
+        return
+
     welcome = (
         "💀 <b>PSL-бот на связи.</b>\n\n"
         "Кидай своё фото (лицо крупно, без очков и фильтров) — "
@@ -832,9 +841,10 @@ def _card_keyboard(credits: dict[str, int] | None = None) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="⚔️ Дуэль 1×1", callback_data="duel_new"),
+                InlineKeyboardButton(text="⚔️ Сразиться (ссылка)", callback_data="duel_link"),
                 InlineKeyboardButton(text="🏆 Общий баттл", callback_data="arena_quick"),
             ],
+            [InlineKeyboardButton(text="⚔️ Дуэль 1×1 в чате", callback_data="duel_new")],
             [InlineKeyboardButton(text=reroll_label, callback_data="reroll")],
             [InlineKeyboardButton(text=studio_label, callback_data="studio")],
             [InlineKeyboardButton(text="🎁 Подарить", callback_data="gift")],
@@ -935,6 +945,142 @@ async def on_duel_new(cb: CallbackQuery) -> None:
         reply_markup=_duel_keyboard(battle_id, open_challenge=True),
         parse_mode="HTML",
     )
+
+# ------------------------------------------------ дуэль по ссылке (без группы)
+
+
+async def _bot_username(bot: Bot) -> str:
+    """Юзернейм бота для t.me-ссылки (кэшируем: me() стоит запрос к Telegram)."""
+    global _BOT_USERNAME
+    if not _BOT_USERNAME:
+        _BOT_USERNAME = (await bot.me()).username or ""
+    return _BOT_USERNAME
+
+
+async def _current_score(user_id: int) -> float:
+    """Балл вызывающего: сперва карточка в памяти, иначе лучший ролл из БД."""
+    from game import db as mog_db
+
+    pending = _pending_full.get(user_id)
+    if pending:
+        return float(_mog_score_tier(pending[0])[0])
+    best = await mog_db.get_best_roll(user_id)
+    return float(best["score"]) if best and best["score"] else 0.0
+
+
+@dp.callback_query(F.data == "duel_link")
+async def on_duel_link(cb: CallbackQuery, bot: Bot) -> None:
+    """«⚔️ Сразиться (ссылка)» под карточкой → вызов, который пересылают другу."""
+    from game import db as mog_db
+    from game import duel_link as mog_duel
+
+    uid = cb.from_user.id
+    score = await _current_score(uid)
+    if score <= 0:
+        await cb.answer("Сначала кинь фото — нужен твой МОГ, чтобы вызвать 🔥", show_alert=True)
+        return
+    await mog_db.get_or_create_user(uid, cb.from_user.full_name, cb.from_user.username or "")
+    try:
+        duel = await mog_duel.create({"id": uid, "name": cb.from_user.full_name}, score)
+    except Exception:  # noqa: BLE001
+        log.exception("duel link create failed")
+        await cb.answer(PUBLIC_ERROR, show_alert=True)
+        return
+    text, _link = mog_duel.invite_text(duel, await _bot_username(bot))
+    await cb.answer("Вызов готов ⚔️", show_alert=True)
+    await cb.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data.startswith("duel_link_accept:"))
+async def on_duel_link_accept(cb: CallbackQuery) -> None:
+    """Соперник принимает вызов из линка."""
+    from game import db as mog_db
+    from game import duel_link as mog_duel
+
+    code = cb.data.split(":", 1)[1]
+    ok, reason = await mog_duel.accept(code, {"id": cb.from_user.id, "name": cb.from_user.full_name})
+    if not ok:
+        pretty = {
+            "not_found": "Вызов не найден или уже сгорел ⌛",
+            "expired": "Вызов истёк ⌛",
+            "closed": "Этот вызов уже принят другим ⚔️",
+            "self": "Себя нельзя 😈",
+        }.get(reason, "Не вышло")
+        await cb.answer(pretty, show_alert=True)
+        return
+    duel = await mog_db.get_duel_link(code)
+    await cb.answer("Вызов принят ⚔️")
+    if not duel:
+        return
+    await cb.message.answer(
+        mog_duel.accepted_text(duel), parse_mode="HTML", disable_web_page_preview=True
+    )
+    # Вызывающий мог быть в другом чате — пишем ему в личку.
+    try:
+        await cb.bot.send_message(
+            int(duel["challenger_id"]), mog_duel.opponent_joined_text(duel), parse_mode="HTML"
+        )
+    except Exception:  # noqa: BLE001 — мог заблокировать бота
+        log.warning("не смог уведомить вызывающего о приёме вызова", exc_info=True)
+
+
+async def _start_duel_invite(msg: Message, bot: Bot, code: str) -> None:
+    """/start duel_<код> — соперник открыл ссылку: показываем вызов и кнопку."""
+    from game import db as mog_db
+    from game import duel_link as mog_duel
+
+    duel = await mog_db.get_duel_link(code)
+    if not duel or duel["status"] != "open":
+        await msg.answer(
+            "⌛ Этот вызов не найден или уже сгорел.\n\n"
+            "Попроси вызывающего сделать новый ⚔️",
+            parse_mode="HTML",
+        )
+        return
+    if duel["challenger_id"] == msg.from_user.id:
+        await msg.answer("Это твой собственный вызов 😏 Перешли его кому-нибудь другому.")
+        return
+    text, _link = mog_duel.invite_text(duel, await _bot_username(bot))
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Принять вызов", callback_data=f"duel_link_accept:{code}"
+                )
+            ]
+        ]
+    )
+    # Согласие спрашиваем ДО разбора — но вызов уже показываем, чтобы не терять его.
+    if not await _ensure_consent(msg, bot):
+        try:
+            await msg.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
+
+async def _duel_sweep(bot: Bot) -> None:
+    """Раз в час гасит просроченные вызовы и пишет вызывающим «соперник слился»."""
+    from game import db as mog_db
+    from game import duel_link as mog_duel
+
+    await asyncio.sleep(180)  # дать сервису подняться
+    while True:
+        try:
+            for duel in await mog_db.expire_duel_links():
+                try:
+                    await bot.send_message(
+                        int(duel["challenger_id"]),
+                        mog_duel.expired_text(duel),
+                        parse_mode="HTML",
+                    )
+                except Exception:  # noqa: BLE001
+                    log.warning("не смог уведомить о сливе", exc_info=True)
+        except Exception:  # noqa: BLE001 — свип не должен ронять бота
+            log.exception("duel sweep failed")
+        await asyncio.sleep(3600)
+
 
 @dp.callback_query(F.data == "arena_quick")
 async def on_arena_quick(cb: CallbackQuery) -> None:
@@ -1860,6 +2006,36 @@ async def _send_mog_card(msg: Message, raw: bytes, score: float, tier: str) -> b
         return False
 
 
+async def _resolve_duel_link(msg: Message, bot: Bot, score: float) -> None:
+    """Если юзер принял вызов по ссылке — считает бой и разсылает табло обоим.
+
+    Молча выходит, если активного боя нет: обычное фото в личке не должно
+    падать из-за отсутствия дуэли.
+    """
+    if msg.chat.type != "private":
+        return
+    from game import duel_link as mog_duel
+
+    try:
+        result = await mog_duel.resolve_for(msg.from_user.id, score)
+    except Exception:  # noqa: BLE001 — дуэль не должна ронять разбор фото
+        log.exception("duel link resolve failed")
+        return
+    if not result:
+        return
+    board = mog_duel.result_text(result)
+    await msg.answer(board, parse_mode="HTML")
+    # Вызывающий в другом чате/личке — пишем ему результат тоже.
+    try:
+        await bot.send_message(
+            int(result["challenger_id"]),
+            "⚔️ <b>Бой окончен!</b>\n\n" + board,
+            parse_mode="HTML",
+        )
+    except Exception:  # noqa: BLE001 — заблокировал бот
+        log.warning("не смог прислать табло вызывающему", exc_info=True)
+
+
 def _mog_stamp(photo_bytes: bytes, score: float, tier: str) -> bytes:
     """Фото + неон-печать «МОГ <балл> · тир» в правом нижнем углу (JPEG bytes)."""
     from PIL import Image, ImageDraw, ImageFilter
@@ -2120,6 +2296,10 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes) -> None:
         # Печать «МОГ» на фото — готово к репосту. Не роняем разбор, если не нарисуется.
         await _send_mog_card(msg, raw, score, tier)
 
+        # ⚔️ Дуэль по ссылке: если этот юзер ПРИНЯЛ вызов и прислал фото — считаем бой
+        # и пишем табло обоим в личку (в группе этот вызов не жил).
+        await _resolve_duel_link(msg, bot, score)
+
         if simple:
             # Футер-вирус: подталкиваем переслать другу (ретеншн).
             await msg.answer(
@@ -2357,6 +2537,7 @@ async def main() -> None:
                 await asyncio.sleep(600)
 
         asyncio.create_task(_keepalive())
+        asyncio.create_task(_duel_sweep(bot))
 
         await asyncio.Event().wait()  # висим вечно
     else:

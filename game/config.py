@@ -48,6 +48,7 @@ TIER_LEGENDARY = 7.28
 
 # TTL хранения байтов фото в памяти (не на диске!).
 PHOTO_TTL_SECONDS = 15 * 60
+DUEL_LINK_TTL_HOURS = int(os.getenv("MOG_DUEL_TTL_HOURS", "24"))  # сколько ждём соперника
 
 # ---------------------------------------------------------------- дисклеймер
 DISCLAIMER = (

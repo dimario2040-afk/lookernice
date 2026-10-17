@@ -21,4 +21,5 @@ venv/
 # archives / junk (user's local backups, never commit)
 *.rar
 *.zip
+*.7z
 *.db
