@@ -174,7 +174,16 @@ _WHY_TAIL_TINY = (
 )
 
 
-def why_line(winner: dict, loser: dict, rng: "random.Random | None" = None) -> str:
+_WHY_TIGHT = (
+    "и этого хватило, чтобы решить исход на волоске",
+    "но общий балл всё равно качнулся одним пикселем",
+    "а сетка упала в его сторону на честном слове",
+)
+
+
+def why_line(
+    winner: dict, loser: dict, rng: "random.Random | None" = None, tight: bool = False
+) -> str:
     """Почему победил именно он — через разницу статов, а не «повезло»."""
     sw = winner.get("stats") or {}
     sl = loser.get("stats") or {}
@@ -189,7 +198,10 @@ def why_line(winner: dict, loser: dict, rng: "random.Random | None" = None) -> s
             "по сумме, а это тоже искусство"
         )
     rng = rng or _rng(key, sw[key], sl[key])
-    if diff >= 25:
+    if tight:
+        # Общий балл решился на волоске — «с запасом» тут звучало бы как враньё.
+        pool = _WHY_TIGHT
+    elif diff >= 25:
         pool = _WHY_TAIL_BIG
     elif diff >= 10:
         pool = _WHY_TAIL_MID
@@ -220,7 +232,7 @@ def match_line(a: dict, b: dict | None, w: dict, *, rng=None) -> str:
         f"   💬 {hype_line(a, b, rng)}",
         f"   ✅ победа: {_fighter(w)} · {_verdict(gap)}",
     ]
-    why = why_line(w, loser, rng)
+    why = why_line(w, loser, rng, tight=gap <= FLAWLESS_GAP)
     if why:
         lines.append(f"   {why}")
     return "\n".join(lines)
