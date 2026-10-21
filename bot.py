@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-17d-consent-min"
+APP_VERSION = "2026-10-17e-tournament"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -756,8 +756,14 @@ async def cmd_start(msg: Message, bot: Bot) -> None:
     )
     # 🔞 Согласие спрашиваем ОДИН раз и МЕЛКО: строка кнопок под приветствием,
     # без абзацев. Полный текст — только за кнопкой «договор».
-    kb = None if await _has_consent(msg.from_user.id) else _consent_keyboard()
-    await msg.answer(welcome, parse_mode="HTML", reply_markup=kb)
+    rows = [
+        [InlineKeyboardButton(text="🏟 Тестовый турнир", callback_data="tt:new")]
+    ]
+    if not await _has_consent(msg.from_user.id):
+        rows += _consent_keyboard().inline_keyboard
+    await msg.answer(
+        welcome, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
 
 
 @dp.message(Command("help"))
@@ -771,6 +777,7 @@ async def cmd_help(msg: Message) -> None:
         "⚔️ Бател: ответь на сообщение и напиши /mog — или /mog без ответа "
         "(открытый вызов, кто примет кнопкой).\n"
         "🏆 Арена до 8: /arena в группе.\n"
+        "🏟 Тестовый турнир (соло, до 8 фото): /tournament в личке со мной.\n"
         "🎒 Артефакты в бою: за Stars, буст до +0.5 (есть 🎁 бесплатный раз в день).\n"
         "🔞 18+ · правила и согласие на обработку данных — /legal",
     )
@@ -1526,6 +1533,309 @@ async def on_arena_new(cb: CallbackQuery) -> None:
     )
     _remember_lobby(arena["id"], sent)
     await cb.answer("Новая арена ⚔️")
+
+
+# ───────────────────────── ТЕСТОВЫЙ ТУРНИР (соло, до 8 фото) ─────────────────
+# Зачем: в чате никого нет и баттл не с кем запустить — человек кидает свои фото,
+# сам разводит пары и смотрит, кто дойдёт до финала. Вайб MK, но без анимации.
+
+_TT_TTL = 60 * 60  # час на всю возню
+_tournaments: dict[int, dict] = {}
+
+
+def _tt_get(user_id: int) -> dict | None:
+    st = _tournaments.get(user_id)
+    if not st:
+        return None
+    if time.time() - st.get("ts", 0) > _TT_TTL:
+        _tournaments.pop(user_id, None)
+        return None
+    return st
+
+
+def _tt_ordered(st: dict) -> list[dict]:
+    """Фото в текущем порядке слотов + номера слотов."""
+    out = []
+    for i, idx in enumerate(st["order"], 1):
+        photo = dict(st["photos"][idx])
+        photo["slot"] = i
+        out.append(photo)
+    return out
+
+
+async def _tt_panel(bot: Bot, st: dict, text: str, kb) -> None:
+    """Правит одну панель вместо новых сообщений (альбом не должен спамить)."""
+    chat_id = st["chat_id"]
+    if st.get("panel_id"):
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=st["panel_id"],
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+        except Exception:  # noqa: BLE001 — сообщение устарело/не изменилось
+            pass
+    sent = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+    st["panel_id"] = getattr(sent, "message_id", None)
+
+
+async def _tt_album(bot: Bot, st: dict) -> None:
+    """Пересылает фото альбомом в текущем порядке (номера = подписи).
+
+    Старый альбом удаляем, иначе после каждого свапа в чате копится мусор.
+    """
+    from aiogram.types import InputMediaPhoto
+
+    chat_id = st["chat_id"]
+    for msg_id in st.get("album", []):
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except Exception:  # noqa: BLE001 — уже удалено/старое
+            pass
+    st["album"] = []
+    ordered = _tt_ordered(st)
+    if not ordered:
+        return
+    media = [
+        InputMediaPhoto(media=p["file_id"], caption=str(p["slot"])) for p in ordered
+    ]
+    try:
+        sent = await bot.send_media_group(chat_id, media=media)
+        st["album"] = [m.message_id for m in sent]
+    except Exception:  # noqa: BLE001
+        log.exception("tournament album failed")
+
+
+async def _tt_open(msg: Message, bot: Bot, *, force_new: bool = False) -> None:
+    """Открывает сбор фото (или возвращает уже открытый)."""
+    from game import tournament as mog_tt
+
+    uid = msg.from_user.id
+    if msg.chat.type != "private":
+        await msg.answer(
+            "🏟 Тестовый турнир — только в личке: напиши мне /tournament в ЛС."
+        )
+        return
+    st = _tt_get(uid)
+    if not st or force_new:
+        if not await _has_consent(uid):
+            _tournaments[uid] = {
+                "stage": "consent",
+                "photos": [],
+                "order": [],
+                "picked": None,
+                "chat_id": msg.chat.id,
+                "ts": time.time(),
+            }
+            await msg.answer("18+", reply_markup=_consent_keyboard())
+            return
+        st = {
+            "stage": "collect",
+            "photos": [],
+            "order": [],
+            "picked": None,
+            "chat_id": msg.chat.id,
+            "ts": time.time(),
+            "album": [],
+        }
+        _tournaments[uid] = st
+    elif st["stage"] != "collect":
+        # Уже на этапе расстановки — не начинаем заново, просто напоминаем.
+        await msg.answer("🏟 Турнир уже открыт — жми «Готово» или «Отмена».")
+        return
+    await _tt_panel(
+        bot, st, mog_tt.collect_text(len(st["photos"])), mog_tt.collect_keyboard(len(st["photos"]))
+    )
+
+
+@dp.message(Command("tournament", "tt", "турнир"))
+async def cmd_tournament(msg: Message, bot: Bot) -> None:
+    """Соло-турнир: до 8 фото, сам разводишь пары, бот играет сетку."""
+    await _tt_open(msg, bot, force_new=True)
+
+
+@dp.callback_query(F.data == "tt:new")
+async def on_tt_new(cb: CallbackQuery, bot: Bot) -> None:
+    await cb.answer()
+    await _tt_open(cb.message, bot, force_new=True)
+
+
+async def _tt_add_photo(msg: Message, bot: Bot, file_id: str) -> None:
+    """Считает МОГ фото сразу и хранит ТОЛЬКО file_id + балл (байтов не держим)."""
+    from game import tournament as mog_tt
+
+    st = _tt_get(msg.from_user.id)
+    if not st or st["stage"] != "collect":
+        return
+    if len(st["photos"]) >= mog_tt.MAX_PHOTOS:
+        await msg.reply(
+            f"Максимум {mog_tt.MAX_PHOTOS} фото. Жми «✅ Готово» — и разводим пары."
+        )
+        return
+    try:
+        tg_file = await bot.get_file(file_id)
+        bio = await bot.download_file(tg_file.file_path)
+        raw = bio.read()
+        score, tier = _mog_score_tier(raw)
+    except Exception:  # noqa: BLE001
+        log.exception("tournament photo failed")
+        await msg.reply("Не смог прочитать это фото — пропустил 🤷")
+        return
+    st["photos"].append({"file_id": file_id, "score": score, "tier": tier})
+    st["order"].append(len(st["photos"]) - 1)
+    st["ts"] = time.time()
+    await _tt_panel(
+        bot, st, mog_tt.collect_text(len(st["photos"])), mog_tt.collect_keyboard(len(st["photos"]))
+    )
+
+
+@dp.callback_query(F.data == "tt:done")
+async def on_tt_done(cb: CallbackQuery, bot: Bot) -> None:
+    """Сбор закончен → альбом с номерами + панель расстановки пар."""
+    from game import tournament as mog_tt
+
+    st = _tt_get(cb.from_user.id)
+    if not st or st["stage"] != "collect":
+        await cb.answer("Турнир уже закрыт", show_alert=True)
+        return
+    if len(st["photos"]) < mog_tt.MIN_PHOTOS:
+        await cb.answer(f"Нужно минимум {mog_tt.MIN_PHOTOS} фото", show_alert=True)
+        return
+    st["stage"] = "seed"
+    st["picked"] = None
+    st["order"] = list(range(len(st["photos"])))
+    await cb.answer("Погнали 🎛")
+    await _tt_album(bot, st)
+    await _tt_panel(
+        bot, st, mog_tt.panel_text(len(st["photos"]), None), mog_tt.slots_keyboard(len(st["photos"]))
+    )
+
+
+@dp.callback_query(F.data.startswith("tt:pick:"))
+async def on_tt_pick(cb: CallbackQuery, bot: Bot) -> None:
+    """Двухтапный свап: выбрал слот — выбрал второй — поменялись местами."""
+    from game import tournament as mog_tt
+
+    st = _tt_get(cb.from_user.id)
+    if not st or st["stage"] != "seed":
+        await cb.answer("Расстановка уже закончилась", show_alert=True)
+        return
+    slot = int(cb.data.split(":")[-1])
+    if slot < 1 or slot > len(st["order"]):
+        await cb.answer("Такого слота нет", show_alert=True)
+        return
+    if st["picked"] is None:
+        st["picked"] = slot
+        await cb.answer(f"Слот {slot} — выбери второй")
+        await _tt_panel(
+            bot,
+            st,
+            mog_tt.panel_text(len(st["order"]), slot),
+            mog_tt.slots_keyboard(len(st["order"]), slot),
+        )
+        return
+    first = st["picked"]
+    st["picked"] = None
+    if first != slot:
+        st["order"][first - 1], st["order"][slot - 1] = (
+            st["order"][slot - 1],
+            st["order"][first - 1],
+        )
+        await cb.answer(f"Поменял {first} ↔ {slot}")
+        await _tt_album(bot, st)
+    else:
+        await cb.answer("Отменил выбор")
+    await _tt_panel(
+        bot,
+        st,
+        mog_tt.panel_text(len(st["order"]), None),
+        mog_tt.slots_keyboard(len(st["order"])),
+    )
+
+
+@dp.callback_query(F.data == "tt:fight")
+async def on_tt_fight(cb: CallbackQuery, bot: Bot) -> None:
+    """Играет сетку по текущему порядку и показывает чемпиона."""
+    from game import tournament as mog_tt
+
+    st = _tt_get(cb.from_user.id)
+    if not st or st["stage"] != "seed":
+        await cb.answer("Сетка уже сыграна", show_alert=True)
+        return
+    items = _tt_ordered(st)
+    rounds, champion = mog_tt.build_rounds(items)
+    if not champion:
+        await cb.answer("Нужно минимум 2 фото", show_alert=True)
+        return
+    st["stage"] = "done"
+    await cb.answer("FIGHT! ⚔️")
+    await _tt_panel(
+        bot,
+        st,
+        mog_tt.result_text(rounds, champion, total=len(items)),
+        mog_tt.fight_keyboard(),
+    )
+    try:
+        await bot.send_photo(
+            st["chat_id"],
+            champion["file_id"],
+            caption=mog_tt.champion_text(champion, total=len(items)),
+            parse_mode="HTML",
+        )
+    except Exception:  # noqa: BLE001 — фото могли удалить
+        log.exception("champion photo failed")
+
+
+@dp.callback_query(F.data == "tt:reset")
+async def on_tt_reset(cb: CallbackQuery, bot: Bot) -> None:
+    """Ещё раз: чистим альбом и начинаем сбор заново."""
+    from game import tournament as mog_tt
+
+    st = _tt_get(cb.from_user.id)
+    if st:
+        for msg_id in st.get("album", []):
+            try:
+                await bot.delete_message(st["chat_id"], msg_id)
+            except Exception:  # noqa: BLE001
+                pass
+    uid = cb.from_user.id
+    _tournaments[uid] = {
+        "stage": "collect",
+        "photos": [],
+        "order": [],
+        "picked": None,
+        "chat_id": cb.message.chat.id,
+        "ts": time.time(),
+        "album": [],
+        "panel_id": st.get("panel_id") if st else None,
+    }
+    await cb.answer("Заново 🔁")
+    await _tt_panel(
+        bot,
+        _tournaments[uid],
+        mog_tt.collect_text(0),
+        mog_tt.collect_keyboard(0),
+    )
+
+
+@dp.callback_query(F.data == "tt:cancel")
+async def on_tt_cancel(cb: CallbackQuery, bot: Bot) -> None:
+    st = _tt_get(cb.from_user.id)
+    if st:
+        for msg_id in st.get("album", []):
+            try:
+                await bot.delete_message(st["chat_id"], msg_id)
+            except Exception:  # noqa: BLE001
+                pass
+    _tournaments.pop(cb.from_user.id, None)
+    await cb.answer("Закрыто")
+    try:
+        await cb.message.edit_text("🏟 Турнир закрыт.")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------- Stars (оплата)
@@ -2329,6 +2639,16 @@ async def on_consent(cb: CallbackQuery, bot: Bot) -> None:
         )
     except Exception:  # noqa: BLE001 — сообщение старое/без клавиатуры
         pass
+    # 🏟 Если человек начал турнир и упёрся в согласие — сразу открываем сбор,
+    # чтобы не заставлять его второй раз жать /tournament.
+    st = _tournaments.get(cb.from_user.id)
+    if st and st.get("stage") == "consent":
+        from game import tournament as mog_tt
+
+        st.update(stage="collect", ts=time.time(), album=[])
+        await _tt_panel(
+            bot, st, mog_tt.collect_text(0), mog_tt.collect_keyboard(0)
+        )
     # 📸 Фото, присланное до согласия, — считаем сразу, от имени ЧЕЛОВЕКА
     # (cb.message.from_user — это бот, поэтому передаём юзера явно).
     entry = _pending_consent.pop(cb.from_user.id, None)
@@ -2340,6 +2660,12 @@ async def on_consent(cb: CallbackQuery, bot: Bot) -> None:
 
 @dp.message(F.photo)
 async def on_photo(msg: Message, bot: Bot) -> None:
+    # 🏟 Режим тестового турнира: не разбираем, а копим фото в сетку.
+    st = _tt_get(msg.from_user.id)
+    if st and st.get("stage") == "collect" and msg.chat.type == "private":
+        await _tt_add_photo(msg, bot, msg.photo[-1].file_id)
+        return
+
     if not TELEGRAM_TOKEN or not MODEL_API_KEY:
         await msg.answer("⚠️ Бот не настроен: нет TELEGRAM_TOKEN или MODEL_API_KEY в .env")
         return
@@ -2380,6 +2706,24 @@ class _MsgAs:
 
     def __getattr__(self, name):
         return getattr(self._msg, name)
+
+
+@dp.message(F.document)
+async def on_document(msg: Message, bot: Bot) -> None:
+    """Файл картинкой (jpg/png «как файл») — только в режиме турнира."""
+    st = _tt_get(msg.from_user.id)
+    if not st or st.get("stage") != "collect" or msg.chat.type != "private":
+        await on_other(msg)
+        return
+    doc = msg.document
+    mime = (doc.mime_type or "").lower()
+    if not mime.startswith("image/"):
+        await msg.answer("Это не картинка. Кидай jpg/png — фото или файлом.")
+        return
+    if (doc.file_size or 0) > 10 * 1024 * 1024:
+        await msg.answer("Файл больше 10 МБ — сожми и кидай ещё.")
+        return
+    await _tt_add_photo(msg, bot, doc.file_id)
 
 
 async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
