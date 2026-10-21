@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-17c-arena-photo"
+APP_VERSION = "2026-10-17d-consent-min"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -754,10 +754,10 @@ async def cmd_start(msg: Message, bot: Bot) -> None:
         "Фото обрабатывается локально (MediaPipe) + нейронка. "
         "Ничего не храню — файл удаляется сразу после анализа."
     )
-    # 🔞 Согласие на обработку ПДн спрашиваем ОДИН РАЗ — при запуске бота.
-    if not await _ensure_consent(msg, bot, intro=welcome + "\n\n"):
-        return
-    await msg.answer(welcome, parse_mode="HTML")
+    # 🔞 Согласие спрашиваем ОДИН раз и МЕЛКО: строка кнопок под приветствием,
+    # без абзацев. Полный текст — только за кнопкой «договор».
+    kb = None if await _has_consent(msg.from_user.id) else _consent_keyboard()
+    await msg.answer(welcome, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(Command("help"))
@@ -1046,23 +1046,22 @@ async def _start_duel_invite(msg: Message, bot: Bot, code: str) -> None:
         await msg.answer("Это твой собственный вызов 😏 Перешли его кому-нибудь другому.")
         return
     text, _link = mog_duel.invite_text(duel, await _bot_username(bot))
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Принять вызов", callback_data=f"duel_link_accept:{code}"
-                )
-            ]
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="✅ Принять вызов", callback_data=f"duel_link_accept:{code}"
+            )
         ]
+    ]
+    # Согласие — той же мелкой строкой, без отдельного сообщения-простыни.
+    if not await _has_consent(msg.from_user.id):
+        rows += _consent_keyboard().inline_keyboard
+    await msg.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        disable_web_page_preview=True,
     )
-    # Согласие спрашиваем ДО разбора — но вызов уже показываем, чтобы не терять его.
-    if not await _ensure_consent(msg, bot):
-        try:
-            await msg.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
-        except Exception:  # noqa: BLE001
-            pass
-        return
-    await msg.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 
 async def _duel_sweep(bot: Bot) -> None:
@@ -2265,54 +2264,44 @@ async def cmd_legal(msg: Message) -> None:
     )
 
 
+async def _has_consent(user_id: int) -> bool:
+    """Согласие уже зафиксировано и версия политики актуальна?"""
+    from game import db as mog_db
+    from game import legal as mog_legal
+
+    row = await mog_db.get_consent(user_id)
+    return bool(row and row["version"] == mog_legal.POLICY_VERSION)
+
+
+def _consent_keyboard() -> InlineKeyboardMarkup:
+    """Одна мелкая строка: «ок» + «договор» (текст политики — только по клику)."""
+    from game import legal as mog_legal
+
+    row = [
+        InlineKeyboardButton(
+            text="✅ ок, 18+", callback_data=f"consent:{mog_legal.POLICY_VERSION}"
+        )
+    ]
+    if PUBLIC_BASE_URL:
+        row.append(InlineKeyboardButton(text="📄 договор", url=f"{PUBLIC_BASE_URL}/legal"))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
 async def _ensure_consent(msg: Message, bot: Bot, intro: str = "") -> bool:
-    """Согласие на обработку ПДн (152-ФЗ). Нет/устарело → шлёт запрос и False."""
+    """Согласие (152-ФЗ). Нет — один мелкий тап, без простыни текста.
+
+    Никаких абзацев: человек видит только «18+» и две кнопки. Полный текст
+    политики живёт за кнопкой «договор» (страница /legal), в чат не вываливается.
+    """
     from game import db as mog_db
     from game import legal as mog_legal
 
     row = await mog_db.get_consent(msg.from_user.id)
     if row and row["version"] == mog_legal.POLICY_VERSION:
         return True
-    link = (
-        f'\n\n📄 Полный текст: <a href="{PUBLIC_BASE_URL}/legal">правила и согласие</a>'
-        if PUBLIC_BASE_URL
-        else ""
-    )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Мне 18+, принимаю",
-                    callback_data=f"consent:{mog_legal.POLICY_VERSION}",
-                )
-            ]
-        ]
-    )
-    # В группе НЕ вываливаем простыню (это спамит чат) — короткий один-тап.
-    if msg.chat.type != "private":
-        rules = (
-            f' (<a href="{PUBLIC_BASE_URL}/legal">правила</a>)'
-            if PUBLIC_BASE_URL
-            else " (подробнее — /legal)"
-        )
-        await msg.answer(
-            "🔞 <b>Один тап — и считаю твой МОГ.</b>\n"
-            "Подтверди, что тебе 18+ и ты согласен на обработку фото для игры"
-            + rules
-            + "\n\n<i>Спросим один раз — дальше просто кидай фото.</i>",
-            reply_markup=kb,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-        return False
-    # Личка — полный текст согласия (тоже один раз: дальше только по /legal).
     await msg.answer(
-        intro
-        + "🔞 <b>Прежде чем считать тебя — нужно согласие</b>\n\n"
-        + mog_legal.consent_short()
-        + link
-        + "\n\n<i>Спрошу один раз. Потом просто кидай фото 👇</i>",
-        reply_markup=kb,
+        "18+",
+        reply_markup=_consent_keyboard(),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -2321,29 +2310,32 @@ async def _ensure_consent(msg: Message, bot: Bot, intro: str = "") -> bool:
 
 @dp.callback_query(F.data.startswith("consent:"))
 async def on_consent(cb: CallbackQuery, bot: Bot) -> None:
-    """Фиксация согласия; если фото уже прислали — запускаем его разбор сразу."""
+    """Один тап по «ок» → фиксируем и сразу продолжаем. Без служебных сообщений."""
     from game import db as mog_db
 
     version = (cb.data or "").split(":", 1)[-1]
-    ts = await mog_db.record_consent(cb.from_user.id, version)
-    await cb.answer("Согласие зафиксировано ✅")
+    await mog_db.record_consent(cb.from_user.id, version)
+    await cb.answer("✅ Погнали")
+    # Убираем строку согласия из клавиатуры, остальные кнопки не трогаем.
     try:
-        await cb.message.edit_reply_markup(reply_markup=None)
-    except Exception:  # noqa: BLE001 — старое/неизменное сообщение
+        kb = getattr(cb.message, "reply_markup", None)
+        rows = [
+            r
+            for r in (kb.inline_keyboard if kb else [])
+            if not any((btn.callback_data or "").startswith("consent:") for btn in r)
+        ]
+        await cb.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+        )
+    except Exception:  # noqa: BLE001 — сообщение старое/без клавиатуры
         pass
-    await cb.message.answer(
-        f"✅ <b>Согласие зафиксировано</b> (политика v{version}, {ts}).",
-        parse_mode="HTML",
-    )
-    # 📸 Фото, присланное до согласия, — считаем без повторной отправки.
+    # 📸 Фото, присланное до согласия, — считаем сразу, от имени ЧЕЛОВЕКА
+    # (cb.message.from_user — это бот, поэтому передаём юзера явно).
     entry = _pending_consent.pop(cb.from_user.id, None)
     if entry:
         stored_at, raw = entry
         if time.time() - stored_at <= _CONSENT_PHOTO_TTL and raw:
-            await cb.message.answer("📸 Вижу твоё фото — начинаю разбор 👇")
-            await _process_photo(cb.message, bot, raw)
-            return
-    await cb.message.answer("Теперь кидай фото 👇")
+            await _process_photo(cb.message, bot, raw, user=cb.from_user)
 
 
 @dp.message(F.photo)
@@ -2373,8 +2365,27 @@ async def on_photo(msg: Message, bot: Bot) -> None:
     await _process_photo(msg, bot, raw)
 
 
-async def _process_photo(msg: Message, bot: Bot, raw: bytes) -> None:
+class _MsgAs:
+    """Чат/сообщение как есть, но от имени нужного юзера.
+
+    Нужно для отложенного фото: жмёшь «ок» под сообщением бота, а разбор должен
+    идти от человека (иначе ролл запишется на бота).
+    """
+
+    __slots__ = ("_msg", "from_user")
+
+    def __init__(self, msg, user):
+        self._msg = msg
+        self.from_user = user
+
+    def __getattr__(self, name):
+        return getattr(self._msg, name)
+
+
+async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
     """Полный разбор: дуэль → биометрия → нейронка → печать «МОГ» + кнопки."""
+    if user is not None:
+        msg = _MsgAs(msg, user)
     status = await msg.answer(
         "📐 Изучаю пропорции…" if BIOMETRY_AVAILABLE else "🧠 Нейронка думает…"
     )
