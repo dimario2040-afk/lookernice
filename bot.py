@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-17e-tournament"
+APP_VERSION = "2026-10-17f-tournament-rounds"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,

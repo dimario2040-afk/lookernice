@@ -25,13 +25,13 @@ def _esc(s: str) -> str:
     return escape(str(s or ""), quote=False)
 
 
-def _round_title(index_from_end: int, total: int) -> str:
-    """Название раунда от финала назад: FINAL / SEMIFINAL / ROUND N."""
-    if index_from_end == 0:
+def _round_title(index: int, total: int) -> str:
+    """Название раунда по порядку: ROUND 1, ROUND 2, ... SEMIFINAL, FINAL."""
+    if index >= total - 1:
         return "FINAL"
-    if index_from_end == 1:
+    if index == total - 2:
         return "SEMIFINAL"
-    return f"ROUND {index_from_end + 1}"
+    return f"ROUND {index + 1}"
 
 
 def build_rounds(items: list[dict]) -> tuple[list[list[tuple]], dict | None]:
@@ -99,7 +99,7 @@ def rounds_text(rounds: list[list[tuple]], *, total: int) -> str:
         return "⚔️ <b>ТЕСТОВЫЙ ТУРНИР</b>\n\nПусто — нужно хотя бы 2 фото."
     out = [f"⚔️ <b>ТЕСТОВЫЙ ТУРНИР</b> · {total} фото", ""]
     for i, matches in enumerate(rounds):
-        title = _round_title(len(rounds) - 1 - i, len(rounds))
+        title = _round_title(i, len(rounds))
         out.append(f"<b>{title} — FIGHT!</b>")
         for a, b, w in matches:
             out.append(match_line(a, b, w))
