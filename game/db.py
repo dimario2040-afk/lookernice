@@ -132,6 +132,32 @@ CREATE TABLE IF NOT EXISTS duel_links (
     expires_at      TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_duel_links_status ON duel_links(status, expires_at);
+
+-- 💳 Обработанные платежи. Telegram доставляет successful_payment повторно, а
+-- раньше каждый повтор начислял товар заново (двойные роллы, два подарка,
+-- два артефакта за одну оплату). Ключ — nonce из payload.
+CREATE TABLE IF NOT EXISTS payments_seen (
+    nonce      TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+
+-- 📸 Дедуп в рамках ОДНОГО чата: перцептивный хэш + хэш байтов. Одна и та же
+-- картинка разбирается один раз — пересылка/повтор не должны заново гонять
+-- нейронку и плодить карточки. Байтов фото тут нет, только числа.
+CREATE TABLE IF NOT EXISTS seen_photos (
+    chat_id    INTEGER NOT NULL,
+    phash      TEXT    NOT NULL,
+    raw_hash   TEXT    NOT NULL DEFAULT '',
+    score      REAL    NOT NULL DEFAULT 0,
+    tier       TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (chat_id, phash)
+);
+CREATE INDEX IF NOT EXISTS idx_seen_raw ON seen_photos(chat_id, raw_hash);
+CREATE INDEX IF NOT EXISTS idx_rolls_user_hash ON rolls(user_id, photo_hash);
+CREATE INDEX IF NOT EXISTS idx_battles_pending ON battles(chat_id, opponent_id, status);
+CREATE INDEX IF NOT EXISTS idx_arenas_chat ON arenas(chat_id, status);
 """
 
 
@@ -149,6 +175,11 @@ async def init_db() -> None:
         return
     _db = await aiosqlite.connect(config.DB_PATH)
     _db.row_factory = aiosqlite.Row
+    # WAL + busy_timeout: ??? ??? ?????? ? ?????? ? ????? ????? ????????? ????
+    # ????? ("database is locked") ??? ????????? ???? ? ?????????? ?????.
+    await _db.execute("PRAGMA journal_mode=WAL")
+    await _db.execute("PRAGMA synchronous=NORMAL")
+    await _db.execute("PRAGMA busy_timeout=5000")
     await _db.executescript(SCHEMA)
     # Мягкая миграция: добавляем колонки, если база создана старой версией.
     for col, ddl in (
@@ -192,25 +223,21 @@ async def get_or_create_user(
 ) -> dict:
     assert _db is not None
     today = _today()
-    cur = await _db.execute("SELECT * FROM users WHERE id=?", (user_id,))
-    row = await cur.fetchone()
-
-    if row is None:
+    # INSERT OR IGNORE ?????? SELECT-?????-INSERT: ??? ????????????? ??????? ??
+    # ?????? ????? ?????? ? IntegrityError, ? ??????? ?? ??????? ?????? ??????.
+    await _db.execute(
+        "INSERT OR IGNORE INTO users (id, first_name, username, rolls_left, rolls_day,"
+        " rolls_total, crits, invites_today, invites_day, best_score, created_at)"
+        " VALUES (?,?,?,?,?,0,0,0,?,0,?)",
+        (user_id, first_name, username, config.FREE_ROLLS_PER_DAY, today, today, _now()),
+    )
+    if first_name or username:
         await _db.execute(
-            "INSERT INTO users (id, first_name, username, rolls_left, rolls_day,"
-            " rolls_total, crits, invites_today, invites_day, best_score, created_at)"
-            " VALUES (?,?,?,?,?,0,0,0,?,0,?)",
-            (user_id, first_name, username, config.FREE_ROLLS_PER_DAY, today, today, _now()),
-        )
-        await _db.commit()
-    else:
-        first_name = first_name or row["first_name"]
-        username = username or row["username"]
-        await _db.execute(
-            "UPDATE users SET first_name=?, username=? WHERE id=?",
+            "UPDATE users SET first_name=COALESCE(NULLIF(?,''), first_name),"
+            " username=COALESCE(NULLIF(?,''), username) WHERE id=?",
             (first_name, username, user_id),
         )
-        await _db.commit()
+    await _db.commit()
 
     await _refresh_daily(user_id)
     cur = await _db.execute("SELECT * FROM users WHERE id=?", (user_id,))
@@ -311,6 +338,101 @@ async def get_best_roll(user_id: int) -> dict | None:
     return _roll_row(row) if row else None
 
 
+async def photo_roll_state(user_id: int, photo_hash: str) -> tuple[int, float | None]:
+    """Сколько раз это фото уже роллили и какой балл был последним.
+
+    Нужно платному рероллу: номер спина задаёт детерминированный новый балл, а
+    «было X» в сообщении — ровно то, что человек видел в прошлый раз.
+    """
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT (SELECT COUNT(*) FROM rolls WHERE user_id=? AND photo_hash=?) AS n,"
+        " (SELECT score FROM rolls WHERE user_id=? AND photo_hash=?"
+        "  ORDER BY id DESC LIMIT 1) AS last_score",
+        (user_id, photo_hash, user_id, photo_hash),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return 0, None
+    return int(row["n"]), row["last_score"]
+
+
+async def claim_battle(battle_id: int, winner_id: int | None) -> bool:
+    """Атомарно закрывает бой. False — его уже закрыли (двойное фото/двойной тап).
+
+    Без условия `status='pending'` два одновременных фото с двух телефонов давали
+    два разных вердикта на один бой.
+    """
+    assert _db is not None
+    cur = await _db.execute(
+        "UPDATE battles SET status='done', winner_id=? WHERE id=? AND status='pending'",
+        (winner_id, battle_id),
+    )
+    await _db.commit()
+    return cur.rowcount > 0
+
+
+async def claim_photo(
+    chat_id: int, phash: str, raw_hash: str, score: float, tier: str
+) -> dict | None:
+    """«Занимает» картинку в чате. None — мы первые, иначе отдаёт прежнюю запись.
+
+    Проверяем два признака: перцептивный хэш (та же картинка после пережатия и
+    ресайза) и sha256 байтов (буквально тот же файл). Атомарно: при гонке двух
+    одновременных отправок разбор начнёт ровно один обработчик.
+    """
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT * FROM seen_photos WHERE chat_id=? AND (phash=? OR raw_hash=?) LIMIT 1",
+        (chat_id, phash, raw_hash or phash),
+    )
+    row = await cur.fetchone()
+    if row:
+        return dict(row)
+    cur = await _db.execute(
+        "INSERT OR IGNORE INTO seen_photos (chat_id, phash, raw_hash, score, tier, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (chat_id, phash, raw_hash, score, tier, _now()),
+    )
+    await _db.commit()
+    if cur.rowcount:
+        return None
+    cur = await _db.execute(
+        "SELECT * FROM seen_photos WHERE chat_id=? AND phash=?", (chat_id, phash)
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else {"phash": phash, "score": score, "tier": tier}
+
+
+async def forget_photo(chat_id: int, phash: str) -> None:
+    """Снимает отметку, если разбор упал и карточку человек так и не увидел."""
+    assert _db is not None
+    await _db.execute(
+        "DELETE FROM seen_photos WHERE chat_id=? AND phash=?", (chat_id, phash)
+    )
+    await _db.commit()
+
+
+async def claim_payment(payload: str) -> bool:
+    """True — платёж видим впервые. False — это повторная доставка того же платежа.
+
+    Bot API прямо предупреждает, что `successful_payment` может прийти несколько
+    раз. Без этой отметки человек получал товар за каждый повтор: двойные роллы,
+    два подарка, два артефакта с одной оплаты.
+    """
+    assert _db is not None
+    parts = (payload or "").split(":")
+    nonce = parts[-1] if len(parts) >= 4 else (payload or "")[:64]
+    if not nonce:
+        return True
+    cur = await _db.execute(
+        "INSERT OR IGNORE INTO payments_seen (nonce, payload, created_at) VALUES (?,?,?)",
+        (nonce, (payload or "")[:200], _now()),
+    )
+    await _db.commit()
+    return cur.rowcount > 0
+
+
 async def get_history(user_id: int, limit: int = 10) -> list[dict]:
     assert _db is not None
     cur = await _db.execute(
@@ -408,14 +530,16 @@ async def finish_battle(battle_id: int, winner_id: int | None) -> None:
 
 async def set_battle_opponent(
     battle_id: int, opponent_id: int, opponent_name: str
-) -> None:
-    """Назначает оппонента открытому вызову (opponent_id=0 → реальный юзер)."""
+) -> bool:
+    """Назначает оппонента открытому вызову. False — его уже забрал другой."""
     assert _db is not None
-    await _db.execute(
-        "UPDATE battles SET opponent_id=?, opponent_name=? WHERE id=?",
+    cur = await _db.execute(
+        "UPDATE battles SET opponent_id=?, opponent_name=?"
+        " WHERE id=? AND opponent_id=0 AND status='pending'",
         (opponent_id, opponent_name, battle_id),
     )
     await _db.commit()
+    return cur.rowcount > 0
 
 
 async def find_pending_battle(chat_id: int, opponent_id: int) -> dict | None:
@@ -478,6 +602,20 @@ async def get_active_arena(chat_id: int) -> dict | None:
     )
     row = await cur.fetchone()
     return dict(row) if row else None
+
+
+async def claim_arena_start(arena_id: int) -> bool:
+    """True -- ?? ??????, ??? ????????? ?????. False -- ????? ??? ????????????.
+
+    ??? ????? ??????? ? ?????????? ??? 8-? ?????? ??????????? ???????????? ?
+    ??????????? ??? ????? ?? ???? ?????.
+    """
+    assert _db is not None
+    cur = await _db.execute(
+        "UPDATE arenas SET status='done' WHERE id=? AND status='lobby'", (arena_id,)
+    )
+    await _db.commit()
+    return cur.rowcount > 0
 
 
 async def set_arena_status(arena_id: int, status: str) -> None:

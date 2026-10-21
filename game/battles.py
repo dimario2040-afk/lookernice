@@ -67,8 +67,9 @@ async def resolve(battle_id: int, opponent_score: float) -> dict:
     # Соперник мог не принять вызов (opponent_id=0) — тогда бой без второй стороны.
     if not oid:
         cid_score = float(battle["challenger_score"] or 0.0)
-        await db.finish_battle(battle_id, cid)
+        fresh = await db.claim_battle(battle_id, cid)
         return {
+            "fresh": fresh,
             "battle_id": battle_id,
             "chat_id": battle["chat_id"],
             "challenger_id": cid,
@@ -100,8 +101,9 @@ async def resolve(battle_id: int, opponent_score: float) -> dict:
     else:
         winner_id = None  # ничья
 
-    await db.finish_battle(battle_id, winner_id)
+    fresh = await db.claim_battle(battle_id, winner_id)
     return {
+        "fresh": fresh,
         "battle_id": battle_id,
         "chat_id": battle["chat_id"],
         "challenger_id": cid,

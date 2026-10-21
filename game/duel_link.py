@@ -80,7 +80,12 @@ async def resolve_for(user_id: int, opponent_score: float) -> dict | None:
 
 
 def _mention(user_id: int, name: str) -> str:
-    return f'<a href="tg://user?id={user_id}">{name}</a>'
+    import html as _html
+
+    # Telegram allows '<' and '&' in names: unescaped they killed the whole
+    # invite/result message ("can't parse entities") and nobody saw the duel.
+    safe = _html.escape(name or "", quote=False)
+    return f'<a href="tg://user?id={user_id}">{safe}</a>'
 
 
 def invite_text(duel: dict, bot_username: str) -> tuple[str, str]:

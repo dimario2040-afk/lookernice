@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-17i-battle-ux"
+APP_VERSION = "2026-10-22a-dedupe-hardening"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -428,6 +428,36 @@ _GARBAGE_MARKERS = (
 )
 
 
+def _esc(text: str) -> str:
+    """HTML-escape for names in parse_mode="HTML" messages.
+
+    Telegram allows '<' and '&' in first names; one such nick used to break the
+    whole message ("can't parse entities") and the user saw nothing.
+    """
+    import html as _html
+
+    return _html.escape(text or "", quote=False)
+
+
+def _escape_bare(text: str) -> str:
+    """Escapes '<', '>' and '&' left after tag stripping, keeping <b>/<i>.
+
+    Telegram rejects ANY bare '<' in parse_mode="HTML" ("can't parse entities"),
+    so a roast like "score < 7" used to kill the whole message and the user got a
+    generic error instead of the text they paid attention for.
+    """
+    kept: dict[str, str] = {}
+    for idx, tag in enumerate(("<b>", "</b>", "<i>", "</i>")):
+        if tag in text:
+            holder = f"\x00{idx}\x00"
+            text = text.replace(tag, holder)
+            kept[holder] = tag
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for holder, tag in kept.items():
+        text = text.replace(holder, tag)
+    return text
+
+
 def _sanitize_roast(text: str) -> str:
     """Чистит ответ VLM: режет HTML/markdown-заборы и битые символы.
 
@@ -441,7 +471,9 @@ def _sanitize_roast(text: str) -> str:
     # битые символы (U+FFFD)
     text = text.replace("\ufffd", "").replace("�", "")
     # HTML-теги кроме наших <b>/<i>
-    text = re.sub(r"<(?!/?[bi]>)[^>]+>", "", text, flags=re.IGNORECASE)
+    # Только настоящие теги: имя начинается с буквы или '/'. Иначе «score < 7 ... <b>»
+    # съедало весь текст до ближайшего '>' вместе с нашим <b>.
+    text = re.sub(r"<(?!/?[bi]\s*>)(/?[a-zA-Z][^<>]*)>", "", text, flags=re.IGNORECASE)
     # markdown-заборы и json-блоки
     text = re.sub(r"```[a-zA-Z0-9_+-]*", "", text)
     # служебные маркеры провайдера
@@ -449,7 +481,7 @@ def _sanitize_roast(text: str) -> str:
         text = text.replace(marker, "")
     text = unicodedata.normalize("NFC", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text
+    return _escape_bare(text)
 
 
 def _extract_roast(resp, fallback_hint: str = "") -> str:
@@ -698,17 +730,38 @@ def analyze_simple(photo_bytes: bytes, metrics_text: str) -> str:
 
 
 # Контекст для кнопок: user_id -> (photo_bytes, metrics_text, metrics_dict).
-# Ограничен PENDING_LIMIT, чтобы бот не съедал RAM у коммерческого инстанса.
+# TTL + лимит по БАЙТАМ, а не по числу: 200 снимков по 5 МБ = гигабайт RAM, а
+# в политике обещано, что фото уходит из памяти.
+_PENDING_TTL = 30 * 60
+_PENDING_BYTES_MAX = 64 * 1024 * 1024
 _pending_full: dict[int, tuple[bytes, str, dict]] = {}
+_pending_full_ts: dict[int, float] = {}
+
+
+def _pending_prune() -> None:
+    now = time.time()
+    for uid in [u for u, ts in _pending_full_ts.items() if now - ts > _PENDING_TTL]:
+        _pending_full.pop(uid, None)
+        _pending_full_ts.pop(uid, None)
+    while _pending_full and sum(len(v[0]) for v in _pending_full.values()) > _PENDING_BYTES_MAX:
+        oldest = min(_pending_full_ts, key=_pending_full_ts.get) if _pending_full_ts else None
+        if oldest is None:
+            _pending_full.clear()
+            break
+        _pending_full.pop(oldest, None)
+        _pending_full_ts.pop(oldest, None)
+
+
+def _pending_photo(user_id: int):
+    """Живой контекст фото или None, если он истёк/вытеснен по памяти."""
+    _pending_prune()
+    return _pending_full.get(user_id)
 
 
 def _remember_photo(user_id: int, raw: bytes, metrics_text: str, metrics: dict) -> None:
-    from game import config as mog_config
-
     _pending_full[user_id] = (raw, metrics_text, metrics)
-    if len(_pending_full) > mog_config.PENDING_LIMIT:
-        for old in list(_pending_full.keys())[: len(_pending_full) - mog_config.PENDING_LIMIT]:
-            _pending_full.pop(old, None)
+    _pending_full_ts[user_id] = time.time()
+    _pending_prune()
 
 
 # Фото, ждущие согласия: user_id -> (unix_ts, raw байты). TTL — чтобы бот не таскал
@@ -852,17 +905,17 @@ async def cmd_mog(msg: Message) -> None:
     c_score = float((trial or {}).get("challenger_score") or 0.0)
     if opponent is None:
         text = (
-            f"⚔️ <b>{challenger['name']}</b> бросает открытый вызов!\n"
+            f"⚔️ <b>{_esc(challenger['name'])}</b> бросает открытый вызов!\n"
             f"Его МОГ: <b>{c_score:.4f}</b>\n\n"
             + _photo_cta(addressed=False)
         )
         kb = _duel_keyboard(battle_id, open_challenge=True)
     else:
         text = (
-            f"⚔️ <b>{challenger['name']}</b> вызывает <b>{opponent['name']}</b> "
+            f"⚔️ <b>{_esc(challenger['name'])}</b> вызывает <b>{_esc(opponent['name'])}</b> "
             "на МОГ-БАТТЛ!\n"
             f"Счёт вызывающего: <b>{c_score:.4f}</b>\n\n"
-            f"👉 <b>{opponent['name']}</b>, твой ход:\n"
+            f"👉 <b>{_esc(opponent['name'])}</b>, твой ход:\n"
             + _photo_cta(addressed=True)
         )
         kb = _duel_keyboard(battle_id, open_challenge=False)
@@ -957,7 +1010,7 @@ async def on_duel_accept(cb: CallbackQuery) -> None:
     battle = await mog_db.get_battle(battle_id)
     their = float((battle or {}).get("challenger_score") or 0.0)
     await cb.message.answer(
-        f"⚔️ <b>{user['name']}</b> принял вызов.\n"
+        f"⚔️ <b>{_esc(user['name'])}</b> принял вызов.\n"
         f"Балл соперника: <b>{their:.4f}</b>\n\n" + _photo_cta(addressed=True),
         parse_mode="HTML",
     )
@@ -986,7 +1039,7 @@ async def on_duel_new(cb: CallbackQuery) -> None:
     battle = await mog_db.get_battle(battle_id)
     their = float((battle or {}).get("challenger_score") or 0.0)
     await cb.message.answer(
-        f"⚔️ <b>{challenger['name']}</b> бросает открытый вызов!\n"
+        f"⚔️ <b>{_esc(challenger['name'])}</b> бросает открытый вызов!\n"
         f"Его МОГ: <b>{their:.4f}</b>\n\n" + _photo_cta(addressed=False),
         reply_markup=_duel_keyboard(battle_id, open_challenge=True),
         parse_mode="HTML",
@@ -1007,7 +1060,7 @@ async def _current_score(user_id: int) -> float:
     """Балл вызывающего: сперва карточка в памяти, иначе лучший ролл из БД."""
     from game import db as mog_db
 
-    pending = _pending_full.get(user_id)
+    pending = _pending_photo(user_id)
     if pending:
         return float(_mog_score_tier(pending[0])[0])
     best = await mog_db.get_best_roll(user_id)
@@ -1287,8 +1340,8 @@ async def on_rematch(cb: CallbackQuery) -> None:
     await cb.answer("Реванш!", show_alert=False)
     await cb.message.reply(
         f"🔁 <b>РЕВАНШ!</b>\n\n"
-        f"{chal['name']} снова вызывает {opp['name']}! "
-        f"{opp['name']}, кинь своё фото — и табло обновится.",
+        f"{_esc(chal['name'])} снова вызывает {_esc(opp['name'])}! "
+        f"{_esc(opp['name'])}, кинь своё фото — и табло обновится.",
         parse_mode="HTML",
     )
     log.info("rematch #%s -> battle #%s", battle_id, new_id)
@@ -1433,6 +1486,9 @@ async def _arena_finish(message, arena_id: int) -> None:
     arena = await mog_db.get_arena(arena_id)
     if not arena:
         return
+    if not await mog_db.claim_arena_start(arena_id):
+        # ????? ??? ??????? (??????? ???? ?? ??????? / ?????????? ?? 8-? ??????).
+        return
     plist = await mog_arena.resolve(arena_id)
     _arena_lobby.pop(arena_id, None)  # лобби больше не живое — редактировать нечего
     text = mog_arena.result_text(arena, plist)
@@ -1503,7 +1559,7 @@ async def on_arena_join(cb: CallbackQuery) -> None:
             _pending_arena[(cb.message.chat.id, cb.from_user.id)] = time.time()
             mention = (
                 f'<a href="tg://user?id={cb.from_user.id}">'
-                f"{cb.from_user.full_name}</a>"
+                f"{_esc(cb.from_user.full_name)}</a>"
             )
             try:
                 await cb.message.answer(
@@ -1724,6 +1780,13 @@ async def _tt_add_photo(msg: Message, bot: Bot, file_id: str) -> None:
         log.exception("tournament photo failed")
         await msg.reply("Не смог прочитать это фото — пропустил 🤷")
         return
+    # В сетке одно и то же фото дважды бессмысленно: балл у него тот же,
+    # а место в паре занимает. Отвечаем коротко и не считаем заново.
+    if any(p.get("hash") == phash for p in st["photos"]):
+        await msg.reply(
+            "📸 Это фото уже в сетке. Кидай другое — иначе сам с собой в паре."
+        )
+        return
     st["photos"].append(
         {
             "file_id": file_id,
@@ -1928,7 +1991,7 @@ async def on_reroll(cb: CallbackQuery, bot: Bot) -> None:
     from game import db as mog_db
     from game import payments
 
-    if cb.from_user.id not in _pending_full:
+    if _pending_photo(cb.from_user.id) is None:
         await cb.answer("📸 Фото уже вышло из памяти — просто кинь его заново.", show_alert=True)
         return
     # 🎁 Подарочный кредит — реролл бесплатно (без счёта).
@@ -1945,20 +2008,43 @@ async def on_reroll(cb: CallbackQuery, bot: Bot) -> None:
 
 
 async def _do_reroll(msg: Message, user_id: int) -> None:
-    """После оплаты: пересчитать то же фото новым роллом и выдать новую печать."""
+    """После оплаты: детерминированный «перекид» того же фото + запись в БД.
+
+    Раньше реролл брал random и ничего не сохранял: человек платил 15★, видел
+    новый балл, а арена/дуэли продолжали показывать старый. Теперь номер спина
+    берётся из истории (фото → сколько раз крутили), балл считается от него,
+    и результат сразу пишется в роллы.
+    """
+    from game import db as mog_db
     from game import rolls as mog_rolls
 
-    data = _pending_full.get(user_id)
+    data = _pending_photo(user_id)
     if not data:
+        # Оплату не сжигаем: возвращаем реролл кредитом, потратить можно в любой момент.
+        try:
+            await mog_db.add_credit(user_id, "reroll", 1)
+        except Exception:  # noqa: BLE001
+            log.exception("reroll credit refund failed")
         await msg.answer(
-            "🔄 Реролл оплачен, но фото уже вышло из памяти. Кинь его заново — пересчёт бесплатный.",
+            "🔄 Реролл оплачен, но фото уже вышло из памяти.\n"
+            "Вернул его кредитом: пришли фото и жми «🔄 Реролл» — спишется кредит, а не звёзды.",
             parse_mode="HTML",
         )
         return
     raw = data[0]
-    prev = round(mog_rolls.base_score(raw), 4)
-    r = mog_rolls.roll(raw)  # новый шум/крит поверх той же базы
+    phash = mog_rolls.photo_hash(raw)
+    try:
+        spins, last = await mog_db.photo_roll_state(user_id, phash)
+    except Exception:  # noqa: BLE001 — история не должна отменять оплаченный реролл
+        log.exception("reroll state failed")
+        spins, last = 0, None
+    prev = float(last) if last is not None else round(mog_rolls.base_score(raw), 4)
+    r = mog_rolls.roll(raw, spin=max(1, spins))
     score, tier = r["score"], r["tier"]
+    try:
+        await mog_db.add_roll(user_id, r)
+    except Exception:  # noqa: BLE001 — карточку всё равно отдаём
+        log.exception("reroll persist failed")
     arrow = "📈" if score > prev else ("📉" if score < prev else "➡️")
     try:
         card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
@@ -1983,7 +2069,7 @@ async def on_studio(cb: CallbackQuery, bot: Bot) -> None:
     from game import db as mog_db
     from game import payments
 
-    if cb.from_user.id not in _pending_full:
+    if _pending_photo(cb.from_user.id) is None:
         await cb.answer("📸 Фото уже вышло из памяти — кинь его заново.", show_alert=True)
         return
     # 🎁 Подарочный кредит — Студия бесплатно (без счёта).
@@ -2001,10 +2087,17 @@ async def on_studio(cb: CallbackQuery, bot: Bot) -> None:
 
 async def _do_studio(msg: Message, user_id: int) -> None:
     """После оплаты: отдать отретушированную карточку (балл не меняется)."""
-    data = _pending_full.get(user_id)
+    data = _pending_photo(user_id)
     if not data:
+        from game import db as mog_db
+
+        try:
+            await mog_db.add_credit(user_id, "studio", 1)
+        except Exception:  # noqa: BLE001
+            log.exception("studio credit refund failed")
         await msg.answer(
-            "🎨 Оплачено, но фото уже вышло из памяти. Кинь заново — ретушь бесплатная.",
+            "🎨 Оплачено, но фото уже вышло из памяти.\n"
+            "Вернул кредитом: пришли фото и жми «🎨 Студия» — спишется кредит.",
             parse_mode="HTML",
         )
         return
@@ -2119,6 +2212,10 @@ async def on_paid(msg: Message, bot: Bot) -> None:
     sp = msg.successful_payment
     product = await payments.grant(sp.invoice_payload)
     product_key, paid_uid, _extras = payments.parse_payload(sp.invoice_payload)
+    if product and product.get("duplicate"):
+        # Повторная доставка того же платежа: молчим, второй раз не начисляем.
+        log.info("duplicate successful_payment: %s", sp.invoice_payload)
+        return
     if product_key == "reroll" and paid_uid:
         await _do_reroll(msg, paid_uid)
         return
@@ -2552,10 +2649,66 @@ async def _resolve_duel_link(msg: Message, bot: Bot, score: float) -> None:
         log.warning("не смог прислать табло вызывающему", exc_info=True)
 
 
-def _battle_bar(W: int, H: int, battle: dict):
-    """Нижняя полоса-табло: ТЫ 7.2041 / VS / ВАСЯ 6.1012 + вердикт.
+_CARD_MAX_SIDE = 1440  # канон рендера: больше Telegram всё равно сжимает
 
-    Без emoji: DejaVu их не рисует, вышли бы квадраты. Только текст и цвет.
+
+def _load_card_image(photo_bytes: bytes):
+    """Фото → RGB в каноне: EXIF-поворот применён, длинная сторона ≤ 1440.
+
+    EXIF-поворот обязателен: iPhone пишет портрет «лежачим» + метку orientation,
+    и без transpose карточка приезжала боком. Канон по размеру нужен, чтобы
+    одинаковое фото в 600px и в 4000px давало один и тот же макет (и не жрало
+    память на free tier: 12 МП в RGBA — это ~100 МБ на рендер).
+    """
+    from PIL import Image, ImageOps
+
+    img = Image.open(io.BytesIO(photo_bytes))
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("RGB")
+    if max(img.size) > _CARD_MAX_SIDE:
+        r = _CARD_MAX_SIDE / max(img.size)
+        img = img.resize(
+            (max(1, round(img.width * r)), max(1, round(img.height * r))),
+            Image.LANCZOS,
+        )
+    return img
+
+
+def _ellipsize(text: str, font, max_w: int, probe) -> str:
+    """Обрезает текст по ФАКТИЧЕСКОЙ ширине шрифта, а не по числу символов.
+
+    Обрезка «[:14]» давала разные ширины: «ШШШШШШ» влезает, «WWWWWWWW» нет —
+    и правый ник наезжал на «VS» или уезжал за кадр.
+    """
+    text = text or ""
+    if max_w <= 0:
+        return ""
+    try:
+        if probe.textlength(text, font=font) <= max_w:
+            return text
+    except Exception:  # noqa: BLE001 — старый Pillow без textlength
+        return text[: max(1, int(max_w / 10))]
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        try:
+            fits = probe.textlength(text[:mid].rstrip() + "…", font=font) <= max_w
+        except Exception:  # noqa: BLE001
+            fits = False
+        if fits:
+            lo = mid
+        else:
+            hi = mid - 1
+    return (text[:lo].rstrip() + "…") if lo else "…"
+
+
+def _battle_bar(W: int, H: int, battle: dict):
+    """Нижняя полоса-табло: ИМЯ 7.2041 / VS / ИМЯ 6.1012 + вердикт.
+
+    Геометрия — от короткой стороны кадра и от реально измеренной ширины текста,
+    без абсолютных «max(20, …)»: на миниатюре 200×200 старый код давал табло в
+    59% высоты и шрифт в 10% ширины, на панораме — текст выше самой полосы.
+    Без emoji: DejaVu их не рисует, вышли бы квадраты.
     """
     from PIL import Image, ImageDraw
 
@@ -2565,50 +2718,87 @@ def _battle_bar(W: int, H: int, battle: dict):
 
     you_s = f'{battle["you_score"]:.4f}'
     foe_s = f'{battle["foe_score"]:.4f}'
-    you_n = (battle.get("you_name") or "ты")[:14]
-    foe_n = (battle.get("foe_name") or "соперник")[:14]
     margin = abs(battle["you_score"] - battle["foe_score"])
-
-    h = max(118, int(H * 0.22))
-    bar = Image.new("RGBA", (W, h), (8, 8, 16, 212))
-    d = ImageDraw.Draw(bar)
-    d.rectangle([0, 0, W, max(3, h // 42)], fill=accent + (255,))
-
-    f_big = _load_font(max(20, int(W * 0.050)))
-    f_small = _load_font(max(12, int(W * 0.022)))
-    pad = int(W * 0.035)
-
-    def measure(txt: str, font) -> int:
-        try:
-            b = d.textbbox((0, 0), txt, font=font)
-            return b[2] - b[0]
-        except Exception:  # noqa: BLE001
-            return len(txt) * 10
-
-    y_name = int(h * 0.20)
-    y_score = int(h * 0.40)
-    y_verdict = int(h * 0.74)
-
-    d.text((pad, y_name), you_n, font=f_small, fill=(205, 205, 225, 255))
-    d.text((pad, y_score), you_s, font=f_big, fill=accent + (255,))
-
-    d.text((W - pad - measure(foe_n, f_small), y_name), foe_n, font=f_small,
-           fill=(205, 205, 225, 255))
-    d.text((W - pad - measure(foe_s, f_big), y_score), foe_s, font=f_big,
-           fill=(225, 225, 240, 255))
-
-    vs = "VS"
-    d.text(((W - measure(vs, f_small)) // 2, y_score + int(h * 0.05)), vs,
-           font=f_small, fill=(140, 140, 165, 255))
-
     if draw_flag:
         verdict = "НИЧЬЯ"
     elif won:
         verdict = f"ПОБЕДА  +{margin:.4f}"
     else:
         verdict = f"ПРОИГРЫШ  -{margin:.4f}"
-    d.text(((W - measure(verdict, f_small)) // 2, y_verdict), verdict,
-           font=f_small, fill=accent + (255,))
+
+    unit = min(W, H)
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+
+    def w_of(txt: str, font) -> int:
+        try:
+            b = probe.textbbox((0, 0), txt, font=font)
+            return b[2] - b[0]
+        except Exception:  # noqa: BLE001
+            return len(txt) * 10
+
+    def h_of(txt: str, font) -> int:
+        try:
+            b = probe.textbbox((0, 0), txt, font=font)
+            return b[3] - b[1]
+        except Exception:  # noqa: BLE001
+            return 10
+
+    vs = "VS"
+    pad = max(4, int(unit * 0.030))
+    # Правый/левый блок не должны доставать до центрального «VS».
+    col_w = (W - 2 * pad - max(10, int(unit * 0.07))) // 2
+
+    def layout(size_big: int) -> dict:
+        f_big = _load_font(size_big)
+        f_small = _load_font(max(7, int(size_big * 0.52)))
+        h_name, h_big = h_of("А", f_small), h_of("0", f_big)
+        gap1 = max(2, int(size_big * 0.10))
+        gap2 = max(2, int(size_big * 0.16))
+        h_bar = pad + h_name + gap1 + h_big + gap2 + h_name + pad
+        return {"f_big": f_big, "f_small": f_small, "h_name": h_name, "h_big": h_big,
+                "gap1": gap1, "gap2": gap2, "h": h_bar}
+
+    # 1) балл «8.8888» обязан влезть в свою колонку
+    size_big = max(9, int(unit * 0.052))
+    for _ in range(8):
+        w_num = w_of("8.8888", _load_font(size_big)) or 1
+        if w_num <= col_w or size_big <= 9:
+            break
+        size_big = max(9, int(size_big * col_w / w_num))
+
+    # 2) табло не забирает больше 45% высоты кадра (миниатюры, панорамы)
+    limit_h = max(24, int(H * 0.45))
+    L = layout(size_big)
+    while L["h"] > limit_h and size_big > 9:
+        size_big = max(9, int(size_big * 0.90))
+        L = layout(size_big)
+    f_big, f_small = L["f_big"], L["f_small"]
+    h = L["h"]  # высота = ровно сумма строк: текст не обрежется
+
+    bar = Image.new("RGBA", (W, h), (8, 8, 16, 212))
+    d = ImageDraw.Draw(bar)
+    d.rectangle([0, 0, W, max(2, h // 40)], fill=accent + (255,))
+
+    you_n = _ellipsize(battle.get("you_name") or "ты", f_small, col_w, probe)
+    foe_n = _ellipsize(battle.get("foe_name") or "соперник", f_small, col_w, probe)
+
+    y_name = pad
+    y_score = y_name + L["h_name"] + L["gap1"]
+    y_verdict = y_score + L["h_big"] + L["gap2"]
+
+    d.text((pad, y_name), you_n, font=f_small, fill=(205, 205, 225, 255))
+    d.text((W - pad - w_of(foe_n, f_small), y_name), foe_n, font=f_small,
+           fill=(205, 205, 225, 255))
+
+    d.text((pad, y_score), you_s, font=f_big, fill=accent + (255,))
+    d.text((W - pad - w_of(foe_s, f_big), y_score), foe_s, font=f_big,
+           fill=(225, 225, 240, 255))
+
+    y_vs = y_score + max(0, (L["h_big"] - h_of(vs, f_small)) // 2)
+    d.text(((W - w_of(vs, f_small)) // 2, y_vs), vs, font=f_small,
+           fill=(140, 140, 165, 255))
+    d.text(((W - w_of(verdict, f_small)) // 2, y_verdict), verdict, font=f_small,
+           fill=accent + (255,))
     return bar, h
 
 
@@ -2619,7 +2809,7 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str, battle: dict | None 
     """
     from PIL import Image, ImageDraw, ImageFilter
 
-    img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+    img = _load_card_image(photo_bytes)
     W, H = img.size
     banner_h = 0
     bar = None
@@ -2632,19 +2822,21 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str, battle: dict | None 
     color = _neon_color(int(round(score / 10.0 * 100)))
     lab, sc, ti = "МОГ", f"{score:.4f}", tier.upper()
 
-    # Размер печати ≈ 34% короткой стороны; шрифт балла подгоняем под ширину.
-    target_w = max(150, int(min(W, H) * 0.34))
-    size = max(18, int(target_w * 0.20))
+    # Печать ≈ 34% короткой стороны, но не больше 52% (иначе на миниатюре
+    # закрывает лицо) и не меньше 22% (иначе нечитаемо). Всё — доли, не px.
+    unit = min(W, H)
+    target_w = min(max(int(unit * 0.34), int(unit * 0.22)), int(unit * 0.52))
+    size = max(9, int(target_w * 0.20))
     f_sc = _load_font(size)
     for _ in range(12):
         bb = f_sc.getbbox(sc)
         w = bb[2] - bb[0]
-        if w <= target_w * 0.74 or size <= 18:
+        if w <= target_w * 0.74 or size <= 9:
             break
-        size = max(18, int(size * (target_w * 0.74) / max(1, w)))
+        size = max(9, int(size * (target_w * 0.74) / max(1, w)))
         f_sc = _load_font(size)
-    f_lab = _load_font(max(14, int(size * 0.50)))
-    f_ti = _load_font(max(12, int(size * 0.42)))
+    f_lab = _load_font(max(7, int(size * 0.50)))
+    f_ti = _load_font(max(6, int(size * 0.42)))
 
     md = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
     b_lab = md.textbbox((0, 0), lab, font=f_lab)
@@ -2681,10 +2873,28 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str, battle: dict | None 
     stamp = stamp.rotate(6, expand=True, resample=Image.BICUBIC)
     glow = stamp.filter(ImageFilter.GaussianBlur(4))
 
-    margin = int(min(W, H) * 0.035)
+    margin = max(3, int(min(W, H) * 0.035))
+
+    # Печать обязана влезть в кадр: поворот на +6° расширяет её, а на панораме
+    # ещё и места по высоте нет. Ужимаем саму печать, а не обрезаем её.
+    def _shrink(im, k: float):
+        return im.resize(
+            (max(1, int(im.width * k)), max(1, int(im.height * k))), Image.LANCZOS
+        )
+
+    room_w = max(1, W - 2 * margin)
+    if stamp.width > room_w:
+        k = room_w / stamp.width
+        stamp, glow = _shrink(stamp, k), glow.filter(ImageFilter.GaussianBlur(2))
+    room_h = max(1, H - banner_h - 2 * margin)
+    if stamp.height > room_h:
+        stamp = _shrink(stamp, room_h / stamp.height)
+        glow = _shrink(glow, room_h / max(1, glow.height))
+
     px = max(0, W - stamp.width - margin)
-    # Печать поднимаем над табло, иначе она ляжет поверх счёта.
-    py = max(0, H - stamp.height - margin - banner_h)
+    py = H - banner_h - stamp.height - margin
+    if py < margin:  # над табло места нет (панорама) — уходим в верхний угол
+        py = margin
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     if bar is not None and banner_h:
         overlay.alpha_composite(bar, (0, H - banner_h))
@@ -2692,9 +2902,9 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str, battle: dict | None 
     overlay.alpha_composite(stamp, (px, py))
 
     out = Image.alpha_composite(img.convert("RGBA"), overlay)
-    if out.width > 1080:
-        ratio = 1080 / out.width
-        out = out.resize((1080, int(out.height * ratio)))
+    if out.width > _CARD_MAX_SIDE:  # страховка, если канон когда-то поднимут
+        ratio = _CARD_MAX_SIDE / out.width
+        out = out.resize((_CARD_MAX_SIDE, int(out.height * ratio)))
     buf = io.BytesIO()
     out.convert("RGB").save(buf, "JPEG", quality=90)
     return buf.getvalue()
@@ -2869,10 +3079,100 @@ async def on_document(msg: Message, bot: Bot) -> None:
     await _tt_add_photo(msg, bot, doc.file_id)
 
 
+async def _resolve_chat_battle(msg: Message, score: float) -> dict | None:
+    """Фото закрывает ждущий бой в этом чате. Возвращает табло или None.
+
+    Вынесено отдельно: путь «повторное фото» тоже должен закрывать бой, но без
+    повторного разбора и без второй карточки результата.
+    """
+    from game import battles as mog_battles
+    from game import db as mog_db
+
+    try:
+        pending = await mog_db.find_pending_battle(msg.chat.id, msg.from_user.id)
+        if not pending:
+            # Открытый вызов, который никто ещё не принял: фото = принятие.
+            # Только если вызов ровно один — иначе непонятно, в какой писать.
+            opens = await mog_db.list_open_battles(msg.chat.id, msg.from_user.id)
+            if len(opens) == 1 and await mog_db.set_battle_opponent(
+                opens[0]["id"], msg.from_user.id, msg.from_user.full_name
+            ):
+                pending = await mog_db.get_battle(opens[0]["id"])
+        if not pending:
+            return None
+        res = await mog_battles.resolve(pending["id"], score)
+        if not res.get("fresh", True):
+            return None  # бой уже закрыт другим фото — молчим, чтобы не дублировать
+        view = mog_battles.view_for(res, msg.from_user.id)
+        await msg.reply(
+            mog_battles.result_text(res),
+            parse_mode="HTML",
+            reply_markup=mog_battles.rematch_keyboard(res),
+        )
+        return view
+    except Exception:  # noqa: BLE001 — батл не должен ронять обычный разбор
+        log.exception("battle resolve failed")
+        return None
+
+
+# Повтор того же фото: отвечаем коротко и не чаще раза в минуту на чат,
+# иначе во флуде бот сам превращается в спамера.
+_dup_notice_at: dict[int, float] = {}
+_DUP_NOTICE_GAP = 60.0
+
+
+async def _dup_notice(msg: Message, seen: dict) -> None:
+    chat_id = msg.chat.id
+    now = time.time()
+    if now - _dup_notice_at.get(chat_id, 0.0) < _DUP_NOTICE_GAP:
+        return
+    _dup_notice_at[chat_id] = now
+    if len(_dup_notice_at) > 2000:
+        _dup_notice_at.clear()
+    score = float(seen.get("score") or 0.0)
+    tier = seen.get("tier") or ""
+    try:
+        await msg.reply(
+            f"📸 Это фото уже было в этом чате — его МОГ <b>{score:.4f}</b>"
+            f"{(' · ' + tier) if tier else ''}.\n"
+            "Повтор не пересчитываю: балл от него не меняется, карточка выше.",
+            parse_mode="HTML",
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("dup notice failed")
+
+
 async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
     """Полный разбор: дуэль → биометрия → нейронка → печать «МОГ» + кнопки."""
     if user is not None:
         msg = _MsgAs(msg, user)
+    from game import db as mog_db
+    from game import rolls as mog_rolls
+
+    # Один авторитетный балл на всё: бой, БД и карточка должны показывать ОДНО
+    # число. base_score детерминирован; roll() с шумом/критом давал другое число,
+    # из-за чего табло боя не совпадало с карточкой.
+    score, tier = _mog_score_tier(raw)
+
+    # 📸 Дедуп в рамках чата: та же картинка (перцептивный хэш) или буквально
+    # тот же файл разбирается ровно один раз — иначе пересылка вниз по чату
+    # запускает нейронку заново. Запись атомарная: при одновременной отправке
+    # двух копий разбор начнёт только один обработчик.
+    phash = mog_rolls.photo_hash(raw)
+    seen = await mog_db.claim_photo(
+        msg.chat.id, phash, mog_rolls.raw_hash(raw), score, tier
+    )
+    if seen is not None:
+        # Единственное, что имеет смысл у повтора, — закрыть ждущий бой.
+        battle_view = await _resolve_chat_battle(msg, float(seen.get("score") or score))
+        if battle_view is None:
+            await _dup_notice(msg, seen)
+            return
+        # Ролл уже записан при первой отправке — второй раз не считаем, иначе
+        # rolls_total и best_score растут от простой пересылки.
+        await _send_mog_card(msg, raw, score, tier, battle=battle_view)
+        return
+
     status = await msg.answer(
         "📐 Изучаю пропорции…" if BIOMETRY_AVAILABLE else "🧠 Нейронка думает…"
     )
@@ -2882,37 +3182,10 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
     metrics = {"face_found": False, "error": "biometry_unavailable"}
     metrics_text = format_metrics(metrics)
     kb = await _card_keyboard_for(msg.from_user.id)
-    # Один авторитетный балл на всё: бой, БД и карточка должны показывать ОДНО
-    # число. base_score детерминирован; roll() с шумом/критом давал другое число,
-    # из-за чего табло боя не совпадало с карточкой.
-    score, tier = _mog_score_tier(raw)
     battle_view: dict | None = None
     try:
-        # ⚔️ ДУЭЛЬ: фото закрывает бой. Работает прямо в чате, без мини-аппа.
-        try:
-            from game import battles as mog_battles
-            from game import db as mog_db
-
-            pending = await mog_db.find_pending_battle(msg.chat.id, msg.from_user.id)
-            if not pending:
-                # Открытый вызов, который никто ещё не принял: фото = принятие.
-                # Только если вызов ровно один — иначе непонятно, в какой писать.
-                opens = await mog_db.list_open_battles(msg.chat.id, msg.from_user.id)
-                if len(opens) == 1:
-                    await mog_db.set_battle_opponent(
-                        opens[0]["id"], msg.from_user.id, msg.from_user.full_name
-                    )
-                    pending = await mog_db.get_battle(opens[0]["id"])
-            if pending:
-                res = await mog_battles.resolve(pending["id"], score)
-                battle_view = mog_battles.view_for(res, msg.from_user.id)
-                await msg.reply(
-                    mog_battles.result_text(res),
-                    parse_mode="HTML",
-                    reply_markup=mog_battles.rematch_keyboard(res),
-                )
-        except Exception:  # noqa: BLE001 — батл не должен ронять обычный разбор
-            log.exception("battle resolve failed")
+        # ⚔️ ДУЭЛЬ: фото закрывает бой (общая логика с веткой повторов).
+        battle_view = await _resolve_chat_battle(msg, score)
 
         # 1. Локальная биометрия (в треде, чтобы не блочить loop).
         # В лайт-режиме хостинга её нет — сразу идём к нейронке по фото.
@@ -2993,6 +3266,12 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
                 sent_card = False
         if not sent_card:
             await msg.answer(_friendly_error(exc) + "\nПопробуй другое фото.")
+            # Разбор упал и печати человек не увидел — снимаем отметку дедупа,
+            # иначе повторная отправка того же фото молча уйдёт в «уже было».
+            try:
+                await mog_db.forget_photo(msg.chat.id, phash)
+            except Exception:  # noqa: BLE001
+                log.exception("forget photo failed")
         try:
             await status.delete()
         except Exception:  # noqa: BLE001, S110
@@ -3014,7 +3293,7 @@ async def on_other(msg: Message) -> None:
 @dp.callback_query(F.data == "full_roast")
 async def on_full_roast(cb: CallbackQuery, bot: Bot) -> None:
     """Кнопка 'Жёсткий разбор': полный PSL-разбор по сохранённому фото."""
-    data = _pending_full.get(cb.from_user.id)
+    data = _pending_photo(cb.from_user.id)
     if not data:
         await cb.answer("Фото устарело — кинь заново 👇", show_alert=True)
         return
@@ -3046,7 +3325,7 @@ async def on_full_roast(cb: CallbackQuery, bot: Bot) -> None:
 @dp.callback_query(F.data == "weakspots")
 async def on_weakspots(cb: CallbackQuery, bot: Bot) -> None:
     """Кнопка 'Слабые места': неон-рамки по зонам лица (красное/зелёное)."""
-    data = _pending_full.get(cb.from_user.id)
+    data = _pending_photo(cb.from_user.id)
     if not data:
         await cb.answer("Фото устарело — кинь заново 👇", show_alert=True)
         return
@@ -3070,7 +3349,7 @@ async def on_weakspots(cb: CallbackQuery, bot: Bot) -> None:
 @dp.callback_query(F.data == "metrics")
 async def on_metrics(cb: CallbackQuery, bot: Bot) -> None:
     """Кнопка 'Замеры (тех)': сырые числа биометрии — только по запросу, под капот."""
-    data = _pending_full.get(cb.from_user.id)
+    data = _pending_photo(cb.from_user.id)
     if not data:
         await cb.answer("Фото устарело — кинь заново 👇", show_alert=True)
         return
@@ -3117,7 +3396,7 @@ async def main() -> None:
             secret = _secrets.token_urlsafe(24)[:32]
             log.warning("WEBHOOK_SECRET пуст/невалиден — сгенерирован случайный, webhook пересоздастся")
         hook_path = f"/webhook/{secret}"
-        app = web.Application()
+        app = web.Application(client_max_size=16 * 1024 * 1024)
 
         async def health(_request: object) -> object:
             # Диагностика деплоя: pil=false -> печать «МОГ» и картинки не рисуются.

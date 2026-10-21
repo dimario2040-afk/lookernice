@@ -102,6 +102,10 @@ async def grant(payload: str) -> dict | None:
     product_key, user_id, extras = parse_payload(payload)
     if not product_key or not user_id:
         return None
+    # Telegram может доставить successful_payment повторно — начисляем ровно раз.
+    if not await db.claim_payment(payload):
+        log.info("duplicate successful_payment, skip: %s", payload)
+        return {"duplicate": True}
     await db.get_or_create_user(user_id)
 
     # 🎒 Артефакт для баттла: цепляем к бою сразу (без инвентаря).
