@@ -116,24 +116,48 @@ async def resolve(battle_id: int, opponent_score: float) -> dict:
     }
 
 
-def result_text(r: dict) -> str:
-    """Табло результата батла в духе хоккейного счёта + тегает обоих."""
-    c = f'<a href="tg://user?id={r["challenger_id"]}">{r["challenger_name"]}</a>'
-    o = f'<a href="tg://user?id={r["opponent_id"]}">{r["opponent_name"]}</a>'
-    cs, os_ = r["challenger_score"], r["opponent_score"]
+def view_for(r: dict, user_id: int) -> dict:
+    """Сводит результат батла к «ты / соперник» — для картинки и подписи.
 
-    board = (
-        "┌───────── ⚔️ ─────────┐\n"
-        f"│  {cs:.4f}  │  {os_:.4f}  │\n"
-        "└────────────────────────┘"
-    )
+    Нужен, потому что фото может прислать и вызывающий, и принимающий: смотрим
+    на user_id, а не на роль в записи боя.
+    """
+    is_ch = r["challenger_id"] == user_id
+    you = r["challenger_score"] if is_ch else r["opponent_score"]
+    foe = r["opponent_score"] if is_ch else r["challenger_score"]
+    you_n = r["challenger_name"] if is_ch else r["opponent_name"]
+    foe_n = r["opponent_name"] if is_ch else r["challenger_name"]
+    return {
+        "you_name": (you_n or "ты").split()[0][:14] if you_n else "ты",
+        "foe_name": (foe_n or "соперник").split()[0][:14] if foe_n else "соперник",
+        "you_score": float(you or 0.0),
+        "foe_score": float(foe or 0.0),
+        "draw": r["winner_id"] is None,
+        "you_won": r["winner_id"] == user_id,
+    }
+
+
+def result_text(r: dict) -> str:
+    """Табло результата батла: два балла, разрыв, победитель и что дальше."""
+    from html import escape
+
+    # Имена приходят из Telegram как есть — экранируем, иначе «<» в нике
+    # роняет отправку с parse_mode=HTML.
+    c_name, o_name = escape(r["challenger_name"]), escape(r["opponent_name"])
+    c = f'<a href="tg://user?id={r["challenger_id"]}">{c_name}</a>'
+    o = f'<a href="tg://user?id={r["opponent_id"]}">{o_name}</a>'
+    cs, os_ = r["challenger_score"], r["opponent_score"]
+    margin = abs(cs - os_)
 
     if r["winner_id"] is None:
-        verdict = f"🤝 <b>НИЧЬЯ</b> — оба на {cs:.4f}. Так себе мог."
+        verdict = f"🤝 <b>НИЧЬЯ</b> — оба на {cs:.4f}. Скучно, но честно."
+        first, second = f"{c} — {cs:.4f}", f"{o} — {os_:.4f}"
     elif r["winner_id"] == r["challenger_id"]:
-        verdict = f"👑 <b>ПОБЕДА: {c}</b>"
+        verdict = f"👑 <b>ПОБЕДА: {c}</b> · разрыв {margin:.4f}"
+        first, second = f"🥇 {c} — <b>{cs:.4f}</b>", f"🥈 {o} — {os_:.4f}"
     else:
-        verdict = f"👑 <b>ПОБЕДА: {o}</b>"
+        verdict = f"👑 <b>ПОБЕДА: {o}</b> · разрыв {margin:.4f}"
+        first, second = f"🥇 {o} — <b>{os_:.4f}</b>", f"🥈 {c} — {cs:.4f}"
 
     boost_block = ""
     c_comp = r.get("challenger_comp") or {}
@@ -150,10 +174,11 @@ def result_text(r: dict) -> str:
             boost_block = "\n".join(blines) + "\n\n"
 
     return (
-        f"🏒 <b>МОГ-БАТТЛ #{r['battle_id']}</b>\n{board}\n"
-        f"{c} — вызывающий · {o} — принимающий\n\n"
+        f"🏒 <b>МОГ-БАТТЛ #{r['battle_id']}</b> · итог\n\n"
+        f"{first}\n{second}\n\n"
         f"{boost_block}"
         f"{verdict}\n\n"
+        "Хочешь отыграться — жми «🔁 Реванш» под этим сообщением.\n"
         "<i>MOG — игра. Баллы случайны, не оценка внешности.</i>"
     )
 

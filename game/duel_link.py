@@ -91,7 +91,8 @@ def invite_text(duel: dict, bot_username: str) -> tuple[str, str]:
         f'⚔️ <b>{_mention(duel["challenger_id"], duel["challenger_name"])}</b> вызывает тебя на дуэль!\n\n'
         f"Его МОГ: <b>{duel['challenger_score']:.4f}</b>\n\n"
         "Жми ссылку — попадёшь в бота, примешь вызов и кинешь своё фото. "
-        f"Кто выше по МОГ — тот и победил.\n\n"
+        "Кто выше по МОГ — тот и победил.\n"
+        "В конце оба получат карточку с табло: два балла, победитель, разрыв.\n\n"
         f"{link}\n\n"
         f'<i>Вызов живёт {hours} ч. Не явишься — он сгорит.</i>'
     )
@@ -100,9 +101,12 @@ def invite_text(duel: dict, bot_username: str) -> tuple[str, str]:
 
 def accepted_text(duel: dict) -> str:
     return (
-        f'⚔️ Ты принял вызов от {_mention(duel["challenger_id"], duel["challenger_name"])}.\n\n'
+        f'⚔️ Ты принял вызов от {_mention(duel["challenger_id"], duel["challenger_name"])}.\n'
         f'Его МОГ: <b>{duel["challenger_score"]:.4f}</b>\n\n'
-        "Кидай своё фото — я посчитаю твой МОГ и выдам табло 👇"
+        "📸 <b>Что кидать:</b> ответь <b>на это сообщение</b> своим фото — "
+        "или просто пришли фото, я жду именно от тебя.\n"
+        "🎁 <b>Что получишь:</b> карточку с твоим МОГ и табло боя на картинке — "
+        "оба балла, кто победил и с каким разрывом."
     )
 
 
@@ -132,8 +136,10 @@ def opponent_joined_text(duel: dict) -> str:
     """Уведомление ВЫЗЫВАЮЩЕМУ, что соперник принял и ждёт фото."""
     return (
         f'⚔️ <b>{_mention(duel["opponent_id"], duel["opponent_name"])}</b> '
-        "принял твой вызов и сейчас кидает фото 👀\n\n"
-        "Как пришлёт — выдам табло обоим."
+        "принял твой вызов и кидает фото 👀\n\n"
+        "Тебе присылать ничего не нужно — твой балл "
+        f'<b>{duel["challenger_score"]:.4f}</b> уже в игре.\n'
+        "Как придёт его фото — выдам табло обоим."
     )
 
 

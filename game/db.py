@@ -430,6 +430,22 @@ async def find_pending_battle(chat_id: int, opponent_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+async def list_open_battles(chat_id: int, exclude_id: int = 0) -> list[dict]:
+    """Открытые вызовы в чате (никто ещё не принял), кроме вызовов самого юзера.
+
+    Нужно, чтобы фото в чате могло закрыть открытый вызов без нажатия кнопки:
+    «просто кинь фото» должно работать буквально, а не только на словах.
+    """
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT * FROM battles WHERE chat_id=? AND opponent_id=0 AND status='pending'"
+        " AND challenger_id<>? ORDER BY id DESC",
+        (chat_id, exclude_id),
+    )
+    rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------- arena
 
 

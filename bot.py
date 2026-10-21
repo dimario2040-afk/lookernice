@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-17h-tournament-comment"
+APP_VERSION = "2026-10-17i-battle-ux"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -776,6 +776,9 @@ async def cmd_help(msg: Message) -> None:
         "Просто отправь фото в чат 👇\n\n"
         "⚔️ Бател: ответь на сообщение и напиши /mog — или /mog без ответа "
         "(открытый вызов, кто примет кнопкой).\n"
+        "   Как кидать: соперник жмёт «Принять» — или просто кидает фото в чат.\n"
+        "   Что получишь: карточку с МОГ и табло боя на картинке "
+        "(оба балла, кто победил, разрыв).\n"
         "🏆 Арена до 8: /arena в группе.\n"
         "🏟 Тестовый турнир (соло, до 8 фото): /tournament в личке со мной.\n"
         "🎒 Артефакты в бою: за Stars, буст до +0.5 (есть 🎁 бесплатный раз в день).\n"
@@ -784,6 +787,30 @@ async def cmd_help(msg: Message) -> None:
 
 
 @dp.message(Command("mog"))
+def _photo_cta(*, addressed: bool = True) -> str:
+    """Единая инструкция для всех вызовов: что кидать, куда и что получишь.
+
+    Открытый вызов нельзя закрыть фото, пока бот не знает, что ты в игре, —
+    поэтому там сначала кнопка (фото тоже работает, если вызов ровно один).
+    """
+    if addressed:
+        how = (
+            "ответь <b>на это сообщение</b> своим фото (кнопка «Ответить» → фото) "
+            "или просто кинь фото в чат — бой закроется сам"
+        )
+    else:
+        how = (
+            "жми «⚔️ Принять» и сразу пришли фото — либо кинь фото в чат: "
+            "если открытый вызов ровно один, я запишу тебя в него сам"
+        )
+    return (
+        f"📸 <b>Что кидать:</b> {how}.\n"
+        "🎁 <b>Что получишь:</b> карточку с твоим МОГ <b>и табло боя на самой "
+        "картинке</b> — оба балла, кто победил и с каким разрывом.\n"
+        "🎯 В зачёт идёт лучший МОГ из твоих фото."
+    )
+
+
 async def cmd_mog(msg: Message) -> None:
     """Вызов на мог-батл: ответь+ /mog (адресно) или /mog без ответа (открытый вызов)."""
     if msg.chat.type == "private":
@@ -821,26 +848,29 @@ async def cmd_mog(msg: Message) -> None:
         await msg.reply(f"💥 {PUBLIC_ERROR}")
         return
 
+    trial = await mog_db.get_battle(battle_id)
+    c_score = float((trial or {}).get("challenger_score") or 0.0)
     if opponent is None:
         text = (
-            f"⚔️ <b>{challenger['name']}</b> бросает открытый вызов!\n\n"
-            "Кто первый жмёт «Принять» — тот и в бою. "
-            "Счёт — твой лучший МОГ. После — просто кинь фото в чат."
+            f"⚔️ <b>{challenger['name']}</b> бросает открытый вызов!\n"
+            f"Его МОГ: <b>{c_score:.4f}</b>\n\n"
+            + _photo_cta(addressed=False)
         )
         kb = _duel_keyboard(battle_id, open_challenge=True)
     else:
         text = (
             f"⚔️ <b>{challenger['name']}</b> вызывает <b>{opponent['name']}</b> "
-            "на МОГ-БАТТЛ!\n\n"
-            f"{opponent['name']}, жми «Принять» — или просто пришли <b>своё фото</b> в чат."
+            "на МОГ-БАТТЛ!\n"
+            f"Счёт вызывающего: <b>{c_score:.4f}</b>\n\n"
+            f"👉 <b>{opponent['name']}</b>, твой ход:\n"
+            + _photo_cta(addressed=True)
         )
         kb = _duel_keyboard(battle_id, open_challenge=False)
 
-    trial = await mog_db.get_battle(battle_id)
     if trial and not trial["challenger_score"]:
         text += (
-            "\n\n⚠️ У вызывающего ещё нет ролла — счёт 0.0000. "
-            "Пусть сначала кинет фото в чат."
+            "\n\n⚠️ У вызывающего ещё нет своего ролла — счёт 0.0000. "
+            "Пусть сначала кинет фото в чат, иначе бой бессмысленный."
         )
     await msg.reply(text, reply_markup=kb, parse_mode="HTML")
 
@@ -924,9 +954,11 @@ async def on_duel_accept(cb: CallbackQuery) -> None:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:  # noqa: BLE001 — сообщение старое/неизменно
         pass
+    battle = await mog_db.get_battle(battle_id)
+    their = float((battle or {}).get("challenger_score") or 0.0)
     await cb.message.answer(
-        f"⚔️ <b>{user['name']}</b> принял вызов! "
-        "Кидай <b>своё фото</b> в чат — и бой закрыт.",
+        f"⚔️ <b>{user['name']}</b> принял вызов.\n"
+        f"Балл соперника: <b>{their:.4f}</b>\n\n" + _photo_cta(addressed=True),
         parse_mode="HTML",
     )
 
@@ -951,9 +983,11 @@ async def on_duel_new(cb: CallbackQuery) -> None:
         await cb.answer(PUBLIC_ERROR, show_alert=True)
         return
     await cb.answer("Вызов брошен ⚔️")
+    battle = await mog_db.get_battle(battle_id)
+    their = float((battle or {}).get("challenger_score") or 0.0)
     await cb.message.answer(
-        f"⚔️ <b>{challenger['name']}</b> бросает открытый вызов!\n\n"
-        "Кто первый жмёт «Принять» — тот и в бою. Потом просто кинь фото.",
+        f"⚔️ <b>{challenger['name']}</b> бросает открытый вызов!\n"
+        f"Его МОГ: <b>{their:.4f}</b>\n\n" + _photo_cta(addressed=False),
         reply_markup=_duel_keyboard(battle_id, open_challenge=True),
         parse_mode="HTML",
     )
@@ -2438,20 +2472,41 @@ def _arena_board_image(players: list[dict]) -> bytes | None:
     return out.getvalue()
 
 
-async def _send_mog_card(msg: Message, raw: bytes, score: float, tier: str) -> bool:
-    """Шлёт фото с печатью «МОГ».
+async def _send_mog_card(
+    msg: Message, raw: bytes, score: float, tier: str, battle: dict | None = None
+) -> bool:
+    """Шлёт фото с печатью «МОГ» (+ табло боя, если это был бой).
 
     Печать рисуется Pillow'ом; если он недоступен (или сломан) — шлём ИСХОДНОЕ фото
     с тем же подписью-баллом. Принцип: юзер ВСЕГДА получает картинку, даже если
     красивость не удалась. Вернёт True, если ушла именно печатная карточка.
     """
-    caption = (
-        f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
-        "😏 Печать стоит — кинь другу"
-    )
+    from html import escape as _h
+
+    if battle:
+        you, foe = battle["you_score"], battle["foe_score"]
+        gap = abs(you - foe)
+        if battle.get("draw"):
+            head = f"🤝 <b>НИЧЬЯ</b> · {you:.4f} vs {foe:.4f}"
+        elif battle.get("you_won"):
+            head = (
+                f"👑 <b>ПОБЕДА</b> над {_h(battle['foe_name'])} · "
+                f"{you:.4f} vs {foe:.4f} (+{gap:.4f})"
+            )
+        else:
+            head = (
+                f"💀 <b>ПРОИГРЫШ</b> от {_h(battle['foe_name'])} · "
+                f"{you:.4f} vs {foe:.4f} (-{gap:.4f})"
+            )
+        caption = f"{head}\n🎲 МОГ {score:.4f} · {tier}\n😏 Табло на картинке — перешли в чат"
+    else:
+        caption = (
+            f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
+            "😏 Печать стоит — кинь другу"
+        )
     card: bytes | None = None
     try:
-        card = await asyncio.to_thread(_mog_stamp, raw, score, tier)
+        card = await asyncio.to_thread(_mog_stamp, raw, score, tier, battle)
     except Exception:  # noqa: BLE001 — без PIL печать недоступна, но фото отправим
         log.exception("stamp failed — отправляю фото без печати")
     try:
@@ -2497,12 +2552,83 @@ async def _resolve_duel_link(msg: Message, bot: Bot, score: float) -> None:
         log.warning("не смог прислать табло вызывающему", exc_info=True)
 
 
-def _mog_stamp(photo_bytes: bytes, score: float, tier: str) -> bytes:
-    """Фото + неон-печать «МОГ <балл> · тир» в правом нижнем углу (JPEG bytes)."""
+def _battle_bar(W: int, H: int, battle: dict):
+    """Нижняя полоса-табло: ТЫ 7.2041 / VS / ВАСЯ 6.1012 + вердикт.
+
+    Без emoji: DejaVu их не рисует, вышли бы квадраты. Только текст и цвет.
+    """
+    from PIL import Image, ImageDraw
+
+    draw_flag = bool(battle.get("draw"))
+    won = bool(battle.get("you_won"))
+    accent = (255, 214, 90) if won else ((160, 160, 180) if draw_flag else (255, 90, 140))
+
+    you_s = f'{battle["you_score"]:.4f}'
+    foe_s = f'{battle["foe_score"]:.4f}'
+    you_n = (battle.get("you_name") or "ты")[:14]
+    foe_n = (battle.get("foe_name") or "соперник")[:14]
+    margin = abs(battle["you_score"] - battle["foe_score"])
+
+    h = max(118, int(H * 0.22))
+    bar = Image.new("RGBA", (W, h), (8, 8, 16, 212))
+    d = ImageDraw.Draw(bar)
+    d.rectangle([0, 0, W, max(3, h // 42)], fill=accent + (255,))
+
+    f_big = _load_font(max(20, int(W * 0.050)))
+    f_small = _load_font(max(12, int(W * 0.022)))
+    pad = int(W * 0.035)
+
+    def measure(txt: str, font) -> int:
+        try:
+            b = d.textbbox((0, 0), txt, font=font)
+            return b[2] - b[0]
+        except Exception:  # noqa: BLE001
+            return len(txt) * 10
+
+    y_name = int(h * 0.20)
+    y_score = int(h * 0.40)
+    y_verdict = int(h * 0.74)
+
+    d.text((pad, y_name), you_n, font=f_small, fill=(205, 205, 225, 255))
+    d.text((pad, y_score), you_s, font=f_big, fill=accent + (255,))
+
+    d.text((W - pad - measure(foe_n, f_small), y_name), foe_n, font=f_small,
+           fill=(205, 205, 225, 255))
+    d.text((W - pad - measure(foe_s, f_big), y_score), foe_s, font=f_big,
+           fill=(225, 225, 240, 255))
+
+    vs = "VS"
+    d.text(((W - measure(vs, f_small)) // 2, y_score + int(h * 0.05)), vs,
+           font=f_small, fill=(140, 140, 165, 255))
+
+    if draw_flag:
+        verdict = "НИЧЬЯ"
+    elif won:
+        verdict = f"ПОБЕДА  +{margin:.4f}"
+    else:
+        verdict = f"ПРОИГРЫШ  -{margin:.4f}"
+    d.text(((W - measure(verdict, f_small)) // 2, y_verdict), verdict,
+           font=f_small, fill=accent + (255,))
+    return bar, h
+
+
+def _mog_stamp(photo_bytes: bytes, score: float, tier: str, battle: dict | None = None) -> bytes:
+    """Фото + неон-печать «МОГ <балл> · тир» в правом нижнем углу (JPEG bytes).
+
+    Если передан battle — снизу добавляется табло: оба балла и вердикт.
+    """
     from PIL import Image, ImageDraw, ImageFilter
 
     img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
     W, H = img.size
+    banner_h = 0
+    bar = None
+    if battle:
+        try:
+            bar, banner_h = _battle_bar(W, H, battle)
+        except Exception:  # noqa: BLE001 — табло не должно ломать карточку
+            log.exception("battle bar failed")
+            banner_h = 0
     color = _neon_color(int(round(score / 10.0 * 100)))
     lab, sc, ti = "МОГ", f"{score:.4f}", tier.upper()
 
@@ -2557,8 +2683,11 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str) -> bytes:
 
     margin = int(min(W, H) * 0.035)
     px = max(0, W - stamp.width - margin)
-    py = max(0, H - stamp.height - margin)
+    # Печать поднимаем над табло, иначе она ляжет поверх счёта.
+    py = max(0, H - stamp.height - margin - banner_h)
     overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    if bar is not None and banner_h:
+        overlay.alpha_composite(bar, (0, H - banner_h))
     overlay.alpha_composite(glow, (px, py))
     overlay.alpha_composite(stamp, (px, py))
 
@@ -2753,18 +2882,30 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
     metrics = {"face_found": False, "error": "biometry_unavailable"}
     metrics_text = format_metrics(metrics)
     kb = await _card_keyboard_for(msg.from_user.id)
+    # Один авторитетный балл на всё: бой, БД и карточка должны показывать ОДНО
+    # число. base_score детерминирован; roll() с шумом/критом давал другое число,
+    # из-за чего табло боя не совпадало с карточкой.
+    score, tier = _mog_score_tier(raw)
+    battle_view: dict | None = None
     try:
-        # ⚔️ ДУЭЛЬ: если этого юзера вызвали на бой — его фото закрывает батл.
-        # Работает прямо в чате, без мини-аппа и без HTTPS.
+        # ⚔️ ДУЭЛЬ: фото закрывает бой. Работает прямо в чате, без мини-аппа.
         try:
             from game import battles as mog_battles
             from game import db as mog_db
-            from game import rolls as mog_rolls
 
             pending = await mog_db.find_pending_battle(msg.chat.id, msg.from_user.id)
+            if not pending:
+                # Открытый вызов, который никто ещё не принял: фото = принятие.
+                # Только если вызов ровно один — иначе непонятно, в какой писать.
+                opens = await mog_db.list_open_battles(msg.chat.id, msg.from_user.id)
+                if len(opens) == 1:
+                    await mog_db.set_battle_opponent(
+                        opens[0]["id"], msg.from_user.id, msg.from_user.full_name
+                    )
+                    pending = await mog_db.get_battle(opens[0]["id"])
             if pending:
-                duel_score = mog_rolls.roll(raw)["score"]
-                res = await mog_battles.resolve(pending["id"], duel_score)
+                res = await mog_battles.resolve(pending["id"], score)
+                battle_view = mog_battles.view_for(res, msg.from_user.id)
                 await msg.reply(
                     mog_battles.result_text(res),
                     parse_mode="HTML",
@@ -2797,15 +2938,14 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
         _remember_photo(msg.from_user.id, raw, metrics_text, metrics)
 
         await status.delete()
-        score, tier = _mog_score_tier(raw)
         mog_line = _mog_tag(raw, score, tier)
 
         # 💾 Сохраняем ролл в БД. Без этого арена и дуэли «не видят» фото:
         # get_best_roll() возвращает пустоту, и вход в игру ругается «сначала фото».
         await _persist_roll(msg, raw, score, tier)
 
-        # Печать «МОГ» на фото — готово к репосту. Не роняем разбор, если не нарисуется.
-        await _send_mog_card(msg, raw, score, tier)
+        # Печать «МОГ» на фото — готово к репосту. Если был бой, снизу табло.
+        await _send_mog_card(msg, raw, score, tier, battle=battle_view)
 
         # ⚔️ Арена: если ждали фото (нажал «Я в деле» без ролла) или уже в лобби —
         # вписываем/обновляем бойца и перерисовываем лобби прямо в чате.
@@ -2840,7 +2980,9 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
                 score, tier = _mog_score_tier(raw)
                 _remember_photo(msg.from_user.id, raw, metrics_text, metrics)
                 await _persist_roll(msg, raw, score, tier)
-                sent_card = await _send_mog_card(msg, raw, score, tier)
+                sent_card = await _send_mog_card(
+                    msg, raw, score, tier, battle=battle_view
+                )
                 await msg.answer(
                     _friendly_error(exc) + "\nПечать твоя 👆 Кнопки ниже живут без нейронки.",
                     reply_markup=kb,
