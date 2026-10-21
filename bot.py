@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-17b-duellink"
+APP_VERSION = "2026-10-17c-arena-photo"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -729,6 +729,11 @@ def _stash_consent_photo(user_id: int, raw: bytes) -> None:
 dp = Dispatcher()
 BOT_ME_ID: int | None = None
 _BOT_USERNAME = ""
+# Хэш (chat_id, user_id) → ts: нажал «Я в деле» без ролла, ждём его фото в этом чате.
+_pending_arena: dict[tuple[int, int], float] = {}
+# arena_id → (chat_id, message_id): живое лобби, чтобы редактировать его, а не плодить.
+_arena_lobby: dict[int, tuple[int, int]] = {}
+_ARENA_PENDING_TTL = 15 * 60
 
 
 @dp.message(Command("start"))
@@ -1099,23 +1104,26 @@ async def on_arena_quick(cb: CallbackQuery) -> None:
         arena, created = await mog_arena.create(cb.message.chat.id, host)
         plist = await mog_arena.players(arena["id"])
         if any(p["user_id"] == host["id"] for p in plist):
-            ok, reason = True, "Ты уже в деле ⚔️"
+            ok, reason, code = True, "Ты уже в деле ⚔️", "already"
         else:
-            ok, reason = await mog_arena.join(arena["id"], host)
+            ok, reason, code = await mog_arena.join(arena["id"], host)
     except Exception:  # noqa: BLE001
         log.exception("arena quick failed")
         await cb.answer(PUBLIC_ERROR, show_alert=True)
         return
     if not ok:
         await cb.answer(reason, show_alert=True)
+        if code == "no_roll":
+            _pending_arena[(cb.message.chat.id, cb.from_user.id)] = time.time()
         return
     await cb.answer("Общий баттл! 🔥" if created else "Ты в арене ⚔️")
     plist = await mog_arena.players(arena["id"])
-    await cb.message.answer(
+    sent = await cb.message.answer(
         mog_arena.lobby_text(arena, plist),
         reply_markup=mog_arena.lobby_keyboard(arena, plist),
         parse_mode="HTML",
     )
+    _remember_lobby(arena["id"], sent)
 
 
 # ───────────────────────── АРТЕФАКТЫ (магазин боя) ─────────────────────────
@@ -1247,6 +1255,116 @@ async def on_rematch(cb: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------- MOG-АРЕНА (битва до 8, чат)
+def _remember_lobby(arena_id: int, message) -> None:
+    """Запоминает живое лобби, чтобы редактировать его, а не постить новое."""
+    try:
+        _arena_lobby[arena_id] = (message.chat.id, message.message_id)
+    except Exception:  # noqa: BLE001 — фейковое сообщение в тестах
+        pass
+
+
+async def _arena_refresh(bot: Bot, arena_id: int) -> None:
+    """Перерисовывает живое лобби (edit), а если сообщение потеряно — постит заново."""
+    from game import arena as mog_arena
+    from game import db as mog_db
+
+    arena = await mog_db.get_arena(arena_id)
+    if not arena:
+        return
+    plist = await mog_arena.players(arena_id)
+    text = mog_arena.lobby_text(arena, plist)
+    kb = mog_arena.lobby_keyboard(arena, plist)
+    target = _arena_lobby.get(arena_id)
+    if target:
+        chat_id, msg_id = target
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+        except Exception:  # noqa: BLE001 — сообщение удалили/не изменилось
+            _arena_lobby.pop(arena_id, None)
+    try:
+        sent = await bot.send_message(
+            arena["chat_id"], text, reply_markup=kb, parse_mode="HTML"
+        )
+        _remember_lobby(arena_id, sent)
+    except Exception:  # noqa: BLE001
+        log.exception("arena refresh failed")
+
+
+async def _persist_roll(msg: Message, raw: bytes, score: float, tier: str) -> None:
+    """Пишет ролл в БД: без этого арена/дуэли считают, что фото не было.
+
+    Балл и тир берём те же, что на карточке (детерминированные), чтобы табло
+    не расходилось с тем, что человек только что увидел.
+    """
+    from game import db as mog_db
+    from game import rolls as mog_rolls
+
+    try:
+        await mog_db.get_or_create_user(
+            msg.from_user.id, msg.from_user.full_name, msg.from_user.username or ""
+        )
+        result = mog_rolls.roll(raw)
+        result["score"] = score
+        result["tier"] = tier
+        result["crit"] = tier == "Mythic"
+        result["failed"] = False
+        await mog_db.add_roll(msg.from_user.id, result)
+    except Exception:  # noqa: BLE001 — история роллов не должна ронять разбор
+        log.exception("add_roll failed")
+
+
+async def _apply_arena_photo(msg: Message, bot: Bot, score: float, tier: str) -> None:
+    """Фото в группе → вписывает в арену или обновляет балл. Молча, если не ждали.
+
+    Автовход только по приглашению (нажал «Я в деле» без ролла) или если игрок
+    уже в лобби, — чтобы случайные фото в чате никого не затягивали в игру.
+    """
+    if msg.chat.type == "private":
+        return
+    from game import arena as mog_arena
+    from game import db as mog_db
+
+    try:
+        arena = await mog_db.get_active_arena(msg.chat.id)
+        if not arena:
+            return
+        key = (msg.chat.id, msg.from_user.id)
+        invited = _pending_arena.get(key)
+        if invited and time.time() - invited > _ARENA_PENDING_TTL:
+            _pending_arena.pop(key, None)
+            invited = None
+        plist = await mog_arena.players(arena["id"])
+        in_arena = any(p["user_id"] == msg.from_user.id for p in plist)
+        if not invited and not in_arena:
+            return
+        user = {"id": msg.from_user.id, "name": msg.from_user.full_name}
+        ok, code = await mog_arena.enter_with_score(arena["id"], user, score, tier)
+        _pending_arena.pop(key, None)
+        if not ok:
+            return
+        await _arena_refresh(bot, arena["id"])
+        if code == "joined":
+            await msg.reply(
+                f"⚔️ Ты в арене! Твой МОГ: <b>{score:.4f}</b> · {tier}. "
+                "Ждём остальных 👇",
+                parse_mode="HTML",
+            )
+        else:
+            await msg.reply(
+                f"♻️ Балл в арене обновлён: <b>{score:.4f}</b> · {tier}.",
+                parse_mode="HTML",
+            )
+    except Exception:  # noqa: BLE001 — арена не должна ронять обычный разбор
+        log.exception("arena photo apply failed")
+
+
 async def _arena_render_lobby(message, arena_id: int) -> None:
     """Перерисовывает лобби-сообщение (не роня при старом/неизменном сообщении)."""
     from game import arena as mog_arena
@@ -1262,6 +1380,7 @@ async def _arena_render_lobby(message, arena_id: int) -> None:
             reply_markup=mog_arena.lobby_keyboard(arena, plist),
             parse_mode="HTML",
         )
+        _remember_lobby(arena_id, message)
     except Exception:  # noqa: BLE001 — текст не изменился или сообщение устарело
         pass
 
@@ -1275,6 +1394,7 @@ async def _arena_finish(message, arena_id: int) -> None:
     if not arena:
         return
     plist = await mog_arena.resolve(arena_id)
+    _arena_lobby.pop(arena_id, None)  # лобби больше не живое — редактировать нечего
     text = mog_arena.result_text(arena, plist)
     btext = mog_arena.bracket_text(arena, plist)
     kb = mog_arena.rematch_keyboard(arena_id)
@@ -1316,11 +1436,12 @@ async def cmd_arena(msg: Message) -> None:
     host = {"id": msg.from_user.id, "name": msg.from_user.full_name}
     arena, _created = await mog_arena.create(msg.chat.id, host)
     plist = await mog_arena.players(arena["id"])
-    await msg.answer(
+    sent = await msg.answer(
         mog_arena.lobby_text(arena, plist),
         reply_markup=mog_arena.lobby_keyboard(arena, plist),
         parse_mode="HTML",
     )
+    _remember_lobby(arena["id"], sent)
 
 
 @dp.callback_query(F.data.startswith("arena_join:"))
@@ -1333,9 +1454,25 @@ async def on_arena_join(cb: CallbackQuery) -> None:
         cb.from_user.id, cb.from_user.full_name, cb.from_user.username or ""
     )
     user = {"id": cb.from_user.id, "name": cb.from_user.full_name}
-    ok, reason = await mog_arena.join(arena_id, user)
+    ok, reason, code = await mog_arena.join(arena_id, user)
     if not ok:
         await cb.answer(reason, show_alert=True)
+        # Нет ролла — не тупик: просим фото прямо в чат и запоминаем ожидание.
+        # Следующее фото этого юзера впишет его в арену автоматически.
+        if code == "no_roll" and cb.message.chat.type != "private":
+            _pending_arena[(cb.message.chat.id, cb.from_user.id)] = time.time()
+            mention = (
+                f'<a href="tg://user?id={cb.from_user.id}">'
+                f"{cb.from_user.full_name}</a>"
+            )
+            try:
+                await cb.message.answer(
+                    f"⚔️ {mention}, кинь фото сюда 👇\n"
+                    "Я сразу впишу тебя в арену — со свежим МОГом, без повторных кнопок.",
+                    parse_mode="HTML",
+                )
+            except Exception:  # noqa: BLE001 — не роняем вход из-за сообщения
+                log.exception("arena prompt failed")
         return
     await cb.answer(reason)
     arena = await mog_db.get_arena(arena_id)
@@ -1383,11 +1520,12 @@ async def on_arena_new(cb: CallbackQuery) -> None:
     host = {"id": cb.from_user.id, "name": cb.from_user.full_name}
     arena, _created = await mog_arena.create(cb.message.chat.id, host)
     plist = await mog_arena.players(arena["id"])
-    await cb.message.answer(
+    sent = await cb.message.answer(
         mog_arena.lobby_text(arena, plist),
         reply_markup=mog_arena.lobby_keyboard(arena, plist),
         parse_mode="HTML",
     )
+    _remember_lobby(arena["id"], sent)
     await cb.answer("Новая арена ⚔️")
 
 
@@ -2293,8 +2431,16 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes) -> None:
         score, tier = _mog_score_tier(raw)
         mog_line = _mog_tag(raw, score, tier)
 
+        # 💾 Сохраняем ролл в БД. Без этого арена и дуэли «не видят» фото:
+        # get_best_roll() возвращает пустоту, и вход в игру ругается «сначала фото».
+        await _persist_roll(msg, raw, score, tier)
+
         # Печать «МОГ» на фото — готово к репосту. Не роняем разбор, если не нарисуется.
         await _send_mog_card(msg, raw, score, tier)
+
+        # ⚔️ Арена: если ждали фото (нажал «Я в деле» без ролла) или уже в лобби —
+        # вписываем/обновляем бойца и перерисовываем лобби прямо в чате.
+        await _apply_arena_photo(msg, bot, score, tier)
 
         # ⚔️ Дуэль по ссылке: если этот юзер ПРИНЯЛ вызов и прислал фото — считаем бой
         # и пишем табло обоим в личку (в группе этот вызов не жил).
@@ -2324,6 +2470,7 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes) -> None:
             try:
                 score, tier = _mog_score_tier(raw)
                 _remember_photo(msg.from_user.id, raw, metrics_text, metrics)
+                await _persist_roll(msg, raw, score, tier)
                 sent_card = await _send_mog_card(msg, raw, score, tier)
                 await msg.answer(
                     _friendly_error(exc) + "\nПечать твоя 👆 Кнопки ниже живут без нейронки.",
@@ -2346,6 +2493,10 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes) -> None:
 
 @dp.message()
 async def on_other(msg: Message) -> None:
+    # В группах молчим: иначе после выключения privacy-режима бот огрызается
+    # на каждое сообщение в чате и его выгоняют.
+    if msg.chat.type != "private":
+        return
     await msg.answer("Мне нужно именно <b>фото</b>, не текст. Кидай ебало 👇", parse_mode="HTML")
 
 

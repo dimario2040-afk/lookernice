@@ -487,6 +487,19 @@ async def add_arena_player(
         return False
 
 
+async def update_arena_player_score(
+    arena_id: int, user_id: int, score: float, tier: str
+) -> bool:
+    """Обновляет снапшот балла в арене (кинул новое фото — пересчитали)."""
+    assert _db is not None
+    cur = await _db.execute(
+        "UPDATE arena_players SET score=?, tier=? WHERE arena_id=? AND user_id=?",
+        (score, tier, arena_id, user_id),
+    )
+    await _db.commit()
+    return cur.rowcount > 0
+
+
 async def remove_arena_player(arena_id: int, user_id: int) -> bool:
     assert _db is not None
     cur = await _db.execute(

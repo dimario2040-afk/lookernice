@@ -56,20 +56,44 @@ async def players(arena_id: int) -> list[dict]:
     return await db.arena_players(arena_id)
 
 
-async def join(arena_id: int, user: dict) -> tuple[bool, str]:
-    """Вступление по ЛУЧШЕМУ роллу юзера. Без ролла — просим сначала кинуть фото."""
+async def join(arena_id: int, user: dict) -> tuple[bool, str, str]:
+    """Вступление по ЛУЧШЕМУ роллу юзера. Без ролла — просим сначала кинуть фото.
+
+    Возвращает (ok, текст_для_юзера, код). Код нужен хэндлеру, чтобы на «нет
+    ролла» предложить кинуть фото прямо в чат, а не просто ругнуться в алерте.
+    """
     arena = await db.get_arena(arena_id)
     if not arena or arena["status"] != "lobby":
-        return False, "Это лобби уже закрыто."
+        return False, "Это лобби уже закрыто.", "closed"
     best = await db.get_best_roll(user["id"])
     if not best:
-        return False, "Сначала кинь фото в чат — получишь свой МОГ, потом жми 👇"
+        return False, "Сначала кинь фото в чат — получишь свой МОГ, потом жми 👇", "no_roll"
     if await db.arena_count(arena_id) >= arena["max_players"]:
-        return False, "Мест нет — стартуем без тебя 😈"
+        return False, "Мест нет — стартуем без тебя 😈", "full"
     added = await db.add_arena_player(
         arena_id, user["id"], user["name"], best["score"], best["tier"]
     )
-    return (True, "Ты в деле ⚔️") if added else (False, "Ты уже в деле.")
+    if added:
+        return True, "Ты в деле ⚔️", "ok"
+    return False, "Ты уже в деле.", "already"
+
+
+async def enter_with_score(
+    arena_id: int, user: dict, score: float, tier: str
+) -> tuple[bool, str]:
+    """Фото в чате: вписывает бойца или обновляет его снапшот свежим баллом.
+
+    Возвращает (ok, joined|updated|full|closed) — код нужен для текста ответа.
+    """
+    arena = await db.get_arena(arena_id)
+    if not arena or arena["status"] != "lobby":
+        return False, "closed"
+    added = await db.add_arena_player(arena_id, user["id"], user["name"], score, tier)
+    if added:
+        return True, "joined"
+    # Уже был в списке — просто обновляем балл (перекинул фото получше).
+    updated = await db.update_arena_player_score(arena_id, user["id"], score, tier)
+    return (True, "updated") if updated else (False, "full")
 
 
 async def leave(arena_id: int, user_id: int) -> bool:
