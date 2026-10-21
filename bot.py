@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-17f-tournament-rounds"
+APP_VERSION = "2026-10-17g-tournament-comment"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -1679,12 +1679,26 @@ async def _tt_add_photo(msg: Message, bot: Bot, file_id: str) -> None:
         tg_file = await bot.get_file(file_id)
         bio = await bot.download_file(tg_file.file_path)
         raw = bio.read()
+        from game import rolls as mog_rolls
+
         score, tier = _mog_score_tier(raw)
+        # Статы нужны для комментария к бою, хэш — чтобы шутки были стабильны
+        # при повторном FIGHT на тех же фото. Байты наружу не уходят.
+        stats = mog_rolls.stats_for(raw)
+        phash = mog_rolls.photo_hash(raw)
     except Exception:  # noqa: BLE001
         log.exception("tournament photo failed")
         await msg.reply("Не смог прочитать это фото — пропустил 🤷")
         return
-    st["photos"].append({"file_id": file_id, "score": score, "tier": tier})
+    st["photos"].append(
+        {
+            "file_id": file_id,
+            "score": score,
+            "tier": tier,
+            "stats": stats,
+            "hash": phash,
+        }
+    )
     st["order"].append(len(st["photos"]) - 1)
     st["ts"] = time.time()
     await _tt_panel(
@@ -1782,7 +1796,7 @@ async def on_tt_fight(cb: CallbackQuery, bot: Bot) -> None:
         await bot.send_photo(
             st["chat_id"],
             champion["file_id"],
-            caption=mog_tt.champion_text(champion, total=len(items)),
+            caption=mog_tt.champion_text(champion, total=len(items), rounds=rounds),
             parse_mode="HTML",
         )
     except Exception:  # noqa: BLE001 — фото могли удалить

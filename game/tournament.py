@@ -75,47 +75,242 @@ def _verdict(gap: float) -> str:
     return "😮‍💨 <b>PHOTO FINISH</b>"
 
 
-def _fighter(p: dict | None) -> str:
-    if p is None:
-        return "—"
-    return f'<b>{p["slot"]}</b>. {_esc(p.get("label") or "Фото")}'
+_STAT_RU = {
+    "jaw": "челюсть",
+    "eyes": "взгляд",
+    "cheeks": "скулы",
+    "harmony": "гармония",
+    "groom": "груминг",
+    "aura": "аура",
+}
+
+# Хайп перед боем — по разнице баллов. Тон: угарный, самоироничный, без травли.
+_HYPE_HUGE = (
+    "букмекеры посмотрели пару и ушли курить",
+    "похоже на спарринг с манекеном, который уже сдался",
+    "второй участник заранее извиняется за неудобства",
+    "разрыв такой, что можно было не выставлять второе фото",
+    "тут не бой, а документальная хроника унижения",
+)
+_HYPE_MID = (
+    "крепкая заруба: фаворит есть, но он об этом не знает",
+    "второй не мальчик для битья, но и не любимец публики",
+    "как борщ без сметаны — съедобно, но никто не в восторге",
+    "нормальный матч, решит не талант, а отсутствие провалов",
+    "судьи уже достали блокноты, зрители — телефоны",
+)
+_HYPE_CLOSE = (
+    "качели: решит один пиксель и немного удачи",
+    "оба на грани, и оба это чувствуют",
+    "ничья по вайбу — разводим по цифрам, как взрослые",
+    "такое обычно заканчивается спором в комментариях",
+    "разница в погрешности, так что победил тот, кто не моргнул",
+)
+
+# Добивка короне.
+_CROWN = (
+    "Корона жмёт. Он терпит.",
+    "Корона подошла с первого раза — такое бывает раз в жизни.",
+    "Корона держится на честном слове и хорошем ракурсе.",
+)
 
 
-def match_line(a: dict, b: dict | None, w: dict) -> str:
-    """Одна строка матча: кто с кем и кто выиграл."""
-    if b is None:
-        return f"▫️ бай — {_fighter(a)} проходит дальше"
+def _rng(*parts) -> "random.Random":
+    """Стабильный рандом: одни и те же фото → одни и те же шутки."""
+    import hashlib
+    import random
+
+    seed = "|".join(str(p) for p in parts)
+    return random.Random(int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16], 16))
+
+
+def _top_stats(p: dict, k: int = 2) -> list[tuple[str, int]]:
+    st = p.get("stats") or {}
+    if not st:
+        return []
+    return sorted(st.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
+
+
+def _grade(v: int) -> str:
+    """Как звучит цифра стата по-человечески."""
+    if v >= 85:
+        return "неприлично"
+    if v >= 70:
+        return "крепко"
+    if v >= 55:
+        return "рабоче"
+    return "на морально-волевых"
+
+
+def hype_line(a: dict, b: dict, rng: "random.Random") -> str:
+    """Подводка к матчу: почему на это стоит смотреть."""
     gap = abs(a["score"] - b["score"])
+    if gap >= FATALITY_GAP:
+        pool = _HYPE_HUGE
+    elif gap <= FLAWLESS_GAP:
+        pool = _HYPE_CLOSE
+    else:
+        pool = _HYPE_MID
+    return rng.choice(pool)
+
+
+_WHY_TAIL_BIG = (
+    "и это не бой, а объяснение",
+    "второй стат даже не приехал",
+    "тут можно было не выходить на ринг",
+    "чистая арифметика без интриги",
+)
+_WHY_TAIL_MID = (
+    "с запасом",
+    "уверенно, без нервов",
+    "как по расписанию",
+    "ровно столько, сколько нужно",
+)
+_WHY_TAIL_TINY = (
+    "на тоненького",
+    "на честном слове и одном пикселе",
+    "судьи дышали через раз",
+    "решил один кадр",
+)
+
+
+def why_line(winner: dict, loser: dict, rng: "random.Random | None" = None) -> str:
+    """Почему победил именно он — через разницу статов, а не «повезло»."""
+    sw = winner.get("stats") or {}
+    sl = loser.get("stats") or {}
+    keys = [k for k in sw if k in sl]
+    if not keys:
+        return ""
+    key = max(keys, key=lambda k: (sw[k] - sl[k], sw[k]))
+    diff = sw[key] - sl[key]
+    if diff <= 0:
+        return (
+            "🧠 Почему: ни один стат не решающий — просто меньше провалов "
+            "по сумме, а это тоже искусство"
+        )
+    rng = rng or _rng(key, sw[key], sl[key])
+    if diff >= 25:
+        pool = _WHY_TAIL_BIG
+    elif diff >= 10:
+        pool = _WHY_TAIL_MID
+    else:
+        pool = _WHY_TAIL_TINY
     return (
-        f'{_fighter(a)} <code>{a["score"]:.4f}</code> '
-        f'⚔ {_fighter(b)} <code>{b["score"]:.4f}</code>\n'
-        f'   → <b>победа: {_fighter(w)}</b> · {_verdict(gap)}'
+        f"🧠 Почему: {_STAT_RU.get(key, key)} {sw[key]} против {sl[key]} — "
+        f"{rng.choice(pool)}"
     )
 
 
+def _fighter(p: dict | None) -> str:
+    if p is None:
+        return "—"
+    return f"<b>#{p['slot']}</b>"
+
+
+def match_line(a: dict, b: dict | None, w: dict, *, rng=None) -> str:
+    """Блок матча: пара, подводка, победа, причина победы."""
+    if b is None:
+        return f"▫️ бай: {_fighter(a)} проходит без боя"
+    rng = rng or _rng(a.get("hash"), b.get("hash"), a["score"], b["score"])
+    gap = abs(a["score"] - b["score"])
+    loser = b if w is a else a
+    lines = [
+        f'🥊 {_fighter(a)} <code>{a["score"]:.4f}</code> '
+        f'⚔ {_fighter(b)} <code>{b["score"]:.4f}</code>',
+        f"   💬 {hype_line(a, b, rng)}",
+        f"   ✅ победа: {_fighter(w)} · {_verdict(gap)}",
+    ]
+    why = why_line(w, loser, rng)
+    if why:
+        lines.append(f"   {why}")
+    return "\n".join(lines)
+
+
+def _seed_of(rounds: list[list[tuple]]) -> str:
+    """Один сид на весь турнир — чтобы повторный FIGHT давал те же шутки."""
+    parts = []
+    for matches in rounds:
+        for a, b, _w in matches:
+            parts.append(str(a.get("hash") or f"{a['slot']}:{a['score']}"))
+            if b is not None:
+                parts.append(str(b.get("hash") or f"{b['slot']}:{b['score']}"))
+    return "|".join(sorted(parts))
+
+
 def rounds_text(rounds: list[list[tuple]], *, total: int) -> str:
-    """Весь турнир одним сообщением: раунды, матчи, добивки."""
+    """Весь турнир одним сообщением: раунды, матчи, подводки, добивки."""
     if not rounds:
         return "⚔️ <b>ТЕСТОВЫЙ ТУРНИР</b>\n\nПусто — нужно хотя бы 2 фото."
+    rng = _rng(_seed_of(rounds))
     out = [f"⚔️ <b>ТЕСТОВЫЙ ТУРНИР</b> · {total} фото", ""]
     for i, matches in enumerate(rounds):
         title = _round_title(i, len(rounds))
         out.append(f"<b>{title} — FIGHT!</b>")
         for a, b, w in matches:
-            out.append(match_line(a, b, w))
+            out.append(match_line(a, b, w, rng=rng))
         out.append("")
     return "\n".join(out).rstrip()
 
 
-def champion_text(champion: dict, *, total: int) -> str:
-    """Финальный блок: кто взял корону."""
-    return (
-        f"🏆 <b>CHAMPION</b> · {_esc(champion.get('label') or 'Фото')} "
-        f"(слот {champion['slot']})\n"
-        f"<b>{champion['score']:.4f}</b> · {_esc(champion['tier'])}\n\n"
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    """Русское склонение: 1 победа / 2 победы / 5 побед."""
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return few
+    return many
+
+
+def _path_line(rounds: list[list[tuple]] | None, champion: dict) -> str:
+    """Путь чемпиона: сколько боёв, сколько баёв, средний разрыв."""
+    if not rounds:
+        return ""
+    wins = [m for r in rounds for m in r if m[2] is champion and m[1] is not None]
+    byes = [m for r in rounds for m in r if m[2] is champion and m[1] is None]
+    if not wins:
+        return ""
+    avg = sum(abs(m[0]["score"] - m[1]["score"]) for m in wins) / len(wins)
+    tail = ""
+    if byes:
+        tail = f" · {len(byes)} " + _plural(len(byes), "бай", "бая", "баёв")
+    cnt = f"{len(wins)} " + _plural(len(wins), "победа", "победы", "побед")
+    return f"🛣 Путь: {cnt}{tail} · средний разрыв {avg:.2f}"
+
+
+def champion_text(
+    champion: dict, *, total: int, rounds: list[list[tuple]] | None = None
+) -> str:
+    """Финальный блок: кто взял корону и ЧЕМ он хорош."""
+    tops = _top_stats(champion, 2)
+    if tops:
+        pairs = " и ".join(f"{_STAT_RU.get(k, k)} {v}" for k, v in tops)
+        grades = {_grade(v) for _, v in tops}
+        # Одинаковая оценка у обоих статов — не повторяем слово дважды.
+        strong = (
+            f"{pairs} — {_grade(tops[0][1])}"
+            if len(grades) == 1 and len(tops) > 1
+            else ", ".join(f"{_STAT_RU.get(k, k)} {v} ({_grade(v)})" for k, v in tops)
+        )
+    else:
+        strong = "данных нет, но харизма на месте"
+    rng = _rng("crown", champion.get("hash"), champion["score"])
+    lines = [
+        f"🏆 <b>CHAMPION</b> · {_fighter(champion)}",
+        f"<b>{champion['score']:.4f}</b> · {_esc(champion['tier'])}",
+        "",
+        f"💪 Чем берёт: {strong}",
+    ]
+    path = _path_line(rounds, champion)
+    if path:
+        lines.append(path)
+    lines += [
+        "",
+        f"👑 {rng.choice(_CROWN)}",
+        "",
         f"<i>Сетка из {total} фото, победитель — по МОГ. MOG — игра, "
-        "баллы случайны, не оценка внешности.</i>"
-    )
+        "баллы случайны, не оценка внешности.</i>",
+    ]
+    return "\n".join(lines)
 
 
 def result_text(rounds: list[list[tuple]], champion: dict, *, total: int) -> str:
@@ -123,7 +318,7 @@ def result_text(rounds: list[list[tuple]], champion: dict, *, total: int) -> str
     return (
         rounds_text(rounds, total=total)
         + "\n\n"
-        + champion_text(champion, total=total)
+        + champion_text(champion, total=total, rounds=rounds)
     )
 
 
