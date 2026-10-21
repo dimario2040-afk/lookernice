@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-22a-dedupe-hardening"
+APP_VERSION = "2026-10-22b-ask-gate"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -3011,6 +3011,97 @@ async def on_consent(cb: CallbackQuery, bot: Bot) -> None:
             await _process_photo(cb.message, bot, raw, user=cb.from_user)
 
 
+# ---------------------------------------------------------------- «это в МОГ?»
+# В группе фото может быть просто фото: человека в отпуске, кота, счёта из бара.
+# Поэтому первый раз (раз в 6 часов на пару чат+человек) бот переспрашивает и
+# заодно проговаривает рамку: 18+, это прикол, а не конкурс красоты.
+_ASK_TTL = 10 * 60
+_ASK_ENTRIES_MAX = 400
+_ASK_COOLDOWN = 6 * 60 * 60
+_ask_pending: dict[str, tuple[float, bytes, int, int]] = {}
+_ask_last: dict[tuple[int, int], float] = {}
+
+
+def _ask_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👌 Оценить", callback_data=f"ask:yes:{token}"),
+                InlineKeyboardButton(text="Мимо", callback_data=f"ask:no:{token}"),
+            ]
+        ]
+    )
+
+
+def _ask_store(raw: bytes, chat_id: int, user_id: int) -> str:
+    """Кладём байты, чтобы «Оценить» не заставляло присылать фото заново."""
+    import secrets
+
+    now = time.time()
+    for tok in [t for t, v in _ask_pending.items() if now - v[0] > _ASK_TTL]:
+        _ask_pending.pop(tok, None)
+    while len(_ask_pending) >= _ASK_ENTRIES_MAX:
+        _ask_pending.pop(min(_ask_pending, key=lambda t: _ask_pending[t][0]), None)
+    token = secrets.token_hex(6)
+    _ask_pending[token] = (now, raw, chat_id, user_id)
+    return token
+
+
+async def _ask_wanted(msg: Message) -> bool:
+    """Спрашивать ли перед разбором. Только группы, только вне явного флоу."""
+    if msg.chat.type not in ("group", "supergroup"):
+        return False
+    key = (msg.chat.id, msg.from_user.id)
+    if time.time() - _ask_last.get(key, 0.0) < _ASK_COOLDOWN:
+        return False
+    from game import db as mog_db
+
+    try:
+        if await mog_db.find_pending_battle(msg.chat.id, msg.from_user.id):
+            return False  # вызов уже объяснил, что происходит
+    except Exception:  # noqa: BLE001 — БД недоступна: лучше спросить, чем молчать
+        pass
+    # Приглашён в арену и кинул фото — он уже понял, что к чему.
+    invited = _pending_arena.get((msg.chat.id, msg.from_user.id))
+    if invited and time.time() - invited <= _ARENA_PENDING_TTL:
+        return False
+    return True
+
+
+@dp.callback_query(F.data.startswith("ask:"))
+async def on_ask(cb: CallbackQuery, bot: Bot) -> None:
+    """«Оценить»/«Мимо» под фото в группе."""
+    parts = (cb.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    token = parts[2] if len(parts) > 2 else ""
+    entry = _ask_pending.get(token)
+    if not entry:
+        await cb.answer("Уже неактуально — пришли фото ещё раз")
+        try:
+            await cb.message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    stored_at, raw, chat_id, user_id = entry
+    if cb.from_user.id != user_id:
+        await cb.answer("Это не твоё фото 😉")
+        return
+    _ask_pending.pop(token, None)
+    if action != "yes" or time.time() - stored_at > _ASK_TTL:
+        await cb.answer("Мимо так мимо")
+        try:
+            await cb.message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    await cb.answer("Погнали 🎰")
+    await _process_photo(cb.message, bot, raw, user=cb.from_user)
+
+
 @dp.message(F.photo)
 async def on_photo(msg: Message, bot: Bot) -> None:
     # 🏟 Режим тестового турнира: не разбираем, а копим фото в сетку.
@@ -3039,6 +3130,18 @@ async def on_photo(msg: Message, bot: Bot) -> None:
     # байты: нажатие «Согласен» запустит обработку этого фото автоматически.
     if not await _ensure_consent(msg, bot):
         _stash_consent_photo(msg.from_user.id, raw)
+        return
+
+    # 🤔 В группе сначала спрашиваем: это вообще в МОГ? Рамка + один тап.
+    if await _ask_wanted(msg):
+        _ask_last[(msg.chat.id, msg.from_user.id)] = time.time()
+        token = _ask_store(raw, msg.chat.id, msg.from_user.id)
+        await msg.reply(
+            "🎰 <b>МОГ</b> · 18+ · не соревнуемся, просто ржём.\n"
+            "Оценить это фото?",
+            reply_markup=_ask_keyboard(token),
+            parse_mode="HTML",
+        )
         return
 
     await _process_photo(msg, bot, raw)
