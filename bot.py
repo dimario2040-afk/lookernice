@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-22e-tt-posts"
+APP_VERSION = "2026-10-22f-teal"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -44,6 +44,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from game import palette as pal  # noqa: E402  (общая бирюзовая палитра картинок)
 from game.config import PUBLIC_ERROR  # noqa: E402  (после load_dotenv — конфиг читает ENV)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -2481,11 +2482,12 @@ SPOT_LINE_WIDTH = max(1, min(3, int(os.getenv("MOG_SPOT_LINE", "2"))))
 
 
 def _neon_color(score: int) -> tuple[int, int, int]:
+    """Цвет зоны в бирюзовой шкале: слабое гаснет, сильное светится."""
     if score < 40:
-        return (255, 45, 94)    # красный — слабая зона
+        return pal.WEAK      # просадка — глухой тил
     if score >= 60:
-        return (56, 132, 255)   # синий — сильная зона
-    return (34, 211, 238)       # циан — нейтрально (в скане не обводим)
+        return pal.STRONG    # козырь — мята
+    return pal.ACCENT        # нейтрально (в скане не обводим)
 
 
 def _draw_neon(d, box, color) -> None:
@@ -2592,8 +2594,8 @@ def spots_caption(items: list) -> str:
     weak = [f"{lab} {sc}" for _k, lab, sc, _c in items if sc < 40]
     good = [f"{lab} {sc}" for _k, lab, sc, _c in items if sc >= 60]
     lines = ["🎯 <b>СЛАБЫЕ МЕСТА</b> · неон-скан", ""]
-    lines.append("🔴 зоны урона: " + (", ".join(weak) if weak else "нет"))
-    lines.append("🔵 halo: " + (", ".join(good) if good else "нет"))
+    lines.append("▫️ просадки: " + (", ".join(weak) if weak else "нет"))
+    lines.append("✦ сильные: " + (", ".join(good) if good else "нет"))
     lines.append("")
     lines.append(f"<i>{mog_config.DISCLAIMER}</i>")
     return "\n".join(lines)
@@ -2625,7 +2627,7 @@ def _load_font(size: int):
 
 
 def _studio_photo(photo_bytes: bytes, score: float, tier: str) -> bytes:
-    """Ванити-ретушь карточки: мягкое сглаживание + тёплый тон + золотая рамка
+    """Ванити-ретушь карточки: сглаживание + прохладный тон + бирюзовая рамка
     + бейдж «MOG STUDIO». Балл/тир НЕ меняются — это чистая косметика."""
     import io
 
@@ -2641,12 +2643,12 @@ def _studio_photo(photo_bytes: bytes, score: float, tier: str) -> bytes:
 
     w, h = img.size
     draw = ImageDraw.Draw(img)
-    gold, gold_light = (212, 175, 55), (255, 230, 140)
+    edge, edge_light = pal.ACCENT, pal.MINT
     frame = max(8, int(min(w, h) * 0.02))
-    draw.rectangle([0, 0, w - 1, h - 1], outline=gold, width=frame)
+    draw.rectangle([0, 0, w - 1, h - 1], outline=edge, width=frame)
     draw.rectangle(
         [frame, frame, w - 1 - frame, h - 1 - frame],
-        outline=gold_light,
+        outline=edge_light,
         width=max(2, frame // 3),
     )
 
@@ -2660,8 +2662,8 @@ def _studio_photo(photo_bytes: bytes, score: float, tier: str) -> bytes:
     pad = max(8, int(w * 0.012))
     x0 = frame + pad
     y0 = h - frame - th - pad * 3
-    draw.rectangle([x0, y0, x0 + tw + pad * 2, y0 + th + pad * 2], fill=(0, 0, 0))
-    draw.text((x0 + pad, y0 + pad), label, font=f, fill=gold_light)
+    draw.rectangle([x0, y0, x0 + tw + pad * 2, y0 + th + pad * 2], fill=pal.TEAL_0)
+    draw.text((x0 + pad, y0 + pad), label, font=f, fill=edge_light)
 
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=90)
@@ -2680,16 +2682,16 @@ def _arena_board_image(players: list[dict]) -> bytes | None:
     W = 1000
     top_pad, row_h, bot_pad = 132, 66, 36
     H = top_pad + row_h * len(ranked) + bot_pad
-    img = Image.new("RGB", (W, H), (13, 13, 24))
+    img = Image.new("RGB", (W, H), pal.TEAL_0)
     draw = ImageDraw.Draw(img)
 
     for x in range(0, W, 40):
-        draw.line([(x, 0), (x, H)], fill=(22, 22, 38), width=1)
+        draw.line([(x, 0), (x, H)], fill=pal.TEAL_1, width=1)
     for y in range(0, H, 40):
-        draw.line([(0, y), (W, y)], fill=(22, 22, 38), width=1)
+        draw.line([(0, y), (W, y)], fill=pal.TEAL_1, width=1)
 
-    neon = [(80, 220, 255), (255, 90, 200), (120, 255, 160)]
-    gold = (255, 214, 90)
+    neon = [pal.MINT, pal.ACCENT, pal.WEAK]
+    gold = pal.MINT
 
     f_title = _load_font(46)
     f_rank = _load_font(34)
@@ -2697,8 +2699,8 @@ def _arena_board_image(players: list[dict]) -> bytes | None:
     f_score = _load_font(34)
     f_tier = _load_font(20)
 
-    draw.text((40, 30), "MOG ARENA", font=f_title, fill=(255, 255, 255))
-    draw.text((44, 90), "itogovoe tablo / final ranking", font=f_tier, fill=(150, 150, 175))
+    draw.text((40, 30), "MOG ARENA", font=f_title, fill=pal.INK)
+    draw.text((44, 90), "itogovoe tablo / final ranking", font=f_tier, fill=pal.MUTED)
 
     maxs = max((p["score"] for p in ranked), default=1.0) or 1.0
     for i, p in enumerate(ranked):
@@ -2712,14 +2714,14 @@ def _arena_board_image(players: list[dict]) -> bytes | None:
                 (40 + 23 - (rb[2] - rb[0]) / 2, y + 23 - (rb[3] - rb[1]) / 2 - rb[1]),
                 rk,
                 font=f_rank,
-                fill=(10, 10, 18),
+                fill=pal.TEAL_0,
             )
         except Exception:  # noqa: BLE001
-            draw.text((48, y + 6), rk, font=f_rank, fill=(10, 10, 18))
+            draw.text((48, y + 6), rk, font=f_rank, fill=pal.TEAL_0)
 
         name = (p.get("name") or "?")[:22]
-        draw.text((110, y + 2), name, font=f_name, fill=(240, 240, 255))
-        draw.text((110, y + 36), str(p.get("tier") or ""), font=f_tier, fill=(150, 150, 175))
+        draw.text((110, y + 2), name, font=f_name, fill=pal.INK)
+        draw.text((110, y + 36), str(p.get("tier") or ""), font=f_tier, fill=pal.MUTED)
 
         sc = f"{p['score']:.4f}"
         try:
@@ -2730,7 +2732,7 @@ def _arena_board_image(players: list[dict]) -> bytes | None:
 
         bar_x0, bar_x1, bar_y = 110, W - 60, y + 58
         frac = max(0.0, min(1.0, p["score"] / maxs))
-        draw.rectangle([bar_x0, bar_y, bar_x1, bar_y + 4], fill=(35, 35, 55))
+        draw.rectangle([bar_x0, bar_y, bar_x1, bar_y + 4], fill=pal.TEAL_2)
         draw.rectangle(
             [bar_x0, bar_y, bar_x0 + int((bar_x1 - bar_x0) * frac), bar_y + 4], fill=col
         )
@@ -2885,7 +2887,7 @@ def _battle_bar(W: int, H: int, battle: dict):
 
     draw_flag = bool(battle.get("draw"))
     won = bool(battle.get("you_won"))
-    accent = (255, 214, 90) if won else ((160, 160, 180) if draw_flag else (255, 90, 140))
+    accent = pal.MINT if won else (pal.MUTED if draw_flag else pal.DIM)
 
     you_s = f'{battle["you_score"]:.4f}'
     foe_s = f'{battle["foe_score"]:.4f}'
@@ -2946,7 +2948,7 @@ def _battle_bar(W: int, H: int, battle: dict):
     f_big, f_small = L["f_big"], L["f_small"]
     h = L["h"]  # высота = ровно сумма строк: текст не обрежется
 
-    bar = Image.new("RGBA", (W, h), (8, 8, 16, 212))
+    bar = Image.new("RGBA", (W, h), pal.TEAL_0 + (214,))
     d = ImageDraw.Draw(bar)
     d.rectangle([0, 0, W, max(2, h // 40)], fill=accent + (255,))
 
@@ -2957,17 +2959,17 @@ def _battle_bar(W: int, H: int, battle: dict):
     y_score = y_name + L["h_name"] + L["gap1"]
     y_verdict = y_score + L["h_big"] + L["gap2"]
 
-    d.text((pad, y_name), you_n, font=f_small, fill=(205, 205, 225, 255))
+    d.text((pad, y_name), you_n, font=f_small, fill=(200, 235, 238, 255))
     d.text((W - pad - w_of(foe_n, f_small), y_name), foe_n, font=f_small,
-           fill=(205, 205, 225, 255))
+           fill=(200, 235, 238, 255))
 
     d.text((pad, y_score), you_s, font=f_big, fill=accent + (255,))
     d.text((W - pad - w_of(foe_s, f_big), y_score), foe_s, font=f_big,
-           fill=(225, 225, 240, 255))
+           fill=pal.INK + (255,))
 
     y_vs = y_score + max(0, (L["h_big"] - h_of(vs, f_small)) // 2)
     d.text(((W - w_of(vs, f_small)) // 2, y_vs), vs, font=f_small,
-           fill=(140, 140, 165, 255))
+           fill=pal.MUTED + (255,))
     d.text(((W - w_of(verdict, f_small)) // 2, y_verdict), verdict, font=f_small,
            fill=accent + (255,))
     return bar, h
@@ -3024,17 +3026,17 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str, battle: dict | None 
     stamp = Image.new("RGBA", (SW, SH), (0, 0, 0, 0))
     d = ImageDraw.Draw(stamp)
     radius = int(min(SW, SH) * 0.20)
-    d.rounded_rectangle([0, 0, SW - 1, SH - 1], radius=radius, fill=(8, 8, 16, 135))
+    d.rounded_rectangle([0, 0, SW - 1, SH - 1], radius=radius, fill=pal.TEAL_0 + (150,))
     for width, alpha in ((max(4, int(SH * 0.06)), 45), (max(2, int(SH * 0.03)), 100), (2, 210)):
         d.rounded_rectangle([0, 0, SW - 1, SH - 1], radius=radius, outline=color + (alpha,), width=width)
-    d.rounded_rectangle([6, 6, SW - 7, SH - 7], radius=max(2, radius - 5), outline=(255, 255, 255, 70), width=1)
+    d.rounded_rectangle([6, 6, SW - 7, SH - 7], radius=max(2, radius - 5), outline=pal.MINT + (80,), width=1)
 
     y = pady
     for i, (txt, font, bbox, fill) in enumerate(
         (
-            (lab, f_lab, b_lab, (255, 255, 255, 255)),
+            (lab, f_lab, b_lab, pal.INK + (255,)),
             (sc, f_sc, b_sc, color + (255,)),
-            (ti, f_ti, b_ti, (255, 255, 255, 225)),
+            (ti, f_ti, b_ti, (214, 240, 240, 225)),
         )
     ):
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
