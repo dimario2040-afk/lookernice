@@ -238,6 +238,117 @@ def match_line(a: dict, b: dict | None, w: dict, *, rng=None) -> str:
     return "\n".join(lines)
 
 
+_NO_LUCK = (
+    "кадр не дотянул",
+    "не хватило одного ракурса",
+    "сетка была против",
+    "фото уходит в архив",
+    "свет упал не туда",
+)
+
+
+def verdict_label(gap: float) -> str:
+    """Вердикт словами без разметки — для штампа на постере и для подписи."""
+    if gap >= FATALITY_GAP:
+        return "FATALITY"
+    if gap >= FLAWLESS_GAP:
+        return "FLAWLESS VICTORY"
+    return "PHOTO FINISH"
+
+
+def top_note(p: dict) -> str:
+    """Козырь фото одной строкой: «челюсть 84». Для постера, без emoji."""
+    tops = _top_stats(p, 1)
+    if not tops:
+        return ""
+    k, v = tops[0]
+    return f"{_STAT_RU.get(k, k)} {v}"
+
+
+def _loser_note(loser: dict, rng) -> str:
+    """Что стало с проигравшим — вторая половина второго абзаца."""
+    tops = _top_stats(loser, 1)
+    if tops:
+        k, v = tops[0]
+        return (
+            f"Проигравшему <b>#{loser['slot']}</b> даже "
+            f"{_STAT_RU.get(k, k)} {v} не помогли: {rng.choice(_NO_LUCK)}."
+        )
+    return f"<b>#{loser['slot']}</b> уходит без трофея: {rng.choice(_NO_LUCK)}."
+
+
+def match_post_text(a: dict, b: dict, w: dict, *, rng=None) -> str:
+    """Два абзаца про бой — подпись к VS-постеру.
+
+    Абзац 1: кто с кем, баллы, разрыв, козыри обоих.
+    Абзац 2: почему победил именно он и что стало с проигравшим.
+    Без HTML-заголовков: их добавляет вызывающий код.
+    """
+    rng = rng or _rng(a.get("hash"), b.get("hash"), a["score"], b["score"])
+    gap = abs(a["score"] - b["score"])
+    loser = b if w is a else a
+
+    para1 = (
+        f"<b>#{a['slot']}</b> {a['score']:.4f} против "
+        f"<b>#{b['slot']}</b> {b['score']:.4f} — разрыв {gap:.4f}. "
+        f"{hype_line(a, b, rng)}"
+    )
+    ta, tb = _top_stats(a, 1), _top_stats(b, 1)
+    if ta and tb:
+        para1 += (
+            f" Козырь первого — {_STAT_RU.get(ta[0][0], ta[0][0])} {ta[0][1]}, "
+            f"второго — {_STAT_RU.get(tb[0][0], tb[0][0])} {tb[0][1]}."
+        )
+
+    core = (
+        f"<b>#{w['slot']}</b> забирает бой — {verdict_label(gap)} "
+        f"с запасом {gap:.4f}."
+    )
+    why = why_line(w, loser, rng, tight=gap <= FLAWLESS_GAP)
+    if why:
+        why_txt = why.replace("🧠 Почему: ", "").strip()
+        if why_txt:
+            core += f" {why_txt[0].upper()}{why_txt[1:]}."
+    return para1 + "\n\n" + core + " " + _loser_note(loser, rng)
+
+
+def bye_post(a: dict, title: str) -> str:
+    """Бай — не бой, но и о нём надо сказать, иначе лента рвётся."""
+    return (
+        f"<b>{title}</b>\n\n"
+        f"▫️ <b>#{a['slot']}</b> проходит дальше без боя: пары не нашлось. "
+        f"Балл у него всё равно {a['score']:.4f} — сетка просто подождала."
+    )
+
+
+def result_header(rounds: list[list[tuple]], champion: dict, *, total: int) -> str:
+    """Короткая шапка после FIGHT: дальше идут отдельные посты по боям."""
+    return (
+        f"⚔️ <b>СЕТКА СЫГРАНА</b> · {total} фото\n\n"
+        f"🏆 Чемпион: <b>#{champion['slot']}</b> · "
+        f"{champion['score']:.4f} · {_esc(champion['tier'])}\n\n"
+        "Ниже — по постеру на каждый бой и два абзаца: как прошло и почему так."
+    )
+
+
+def path_plain(rounds: list[list[tuple]] | None, champion: dict) -> str:
+    """Путь чемпиона без emoji — для постера (DejaVu не рисует эмодзи)."""
+    if not rounds:
+        return ""
+    wins = [m for r in rounds for m in r if m[2] is champion and m[1] is not None]
+    if not wins:
+        return ""
+    avg = sum(abs(m[0]["score"] - m[1]["score"]) for m in wins) / len(wins)
+    cnt = f"{len(wins)} " + _plural(len(wins), "победа", "победы", "побед")
+    return f"{cnt} · средний разрыв {avg:.2f}"
+
+
+def crown_line(champion: dict) -> str:
+    """Та же коронная фраза, что в подписи: один сид → один и тот же текст."""
+    rng = _rng("crown", champion.get("hash"), champion["score"])
+    return rng.choice(_CROWN)
+
+
 def _seed_of(rounds: list[list[tuple]]) -> str:
     """Один сид на весь турнир — чтобы повторный FIGHT давал те же шутки."""
     parts = []

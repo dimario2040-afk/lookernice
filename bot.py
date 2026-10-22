@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-22d-tag-face"
+APP_VERSION = "2026-10-22e-tt-posts"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -1813,6 +1813,15 @@ async def _tt_add_photo(msg: Message, bot: Bot, file_id: str) -> None:
             "📸 Это фото уже в сетке. Кидай другое — иначе сам с собой в паре."
         )
         return
+    # 🖼 Миниатюра для VS-постеров: ≤720 px, ~100 КБ. Оригинал не держим —
+    # но и не перекачиваем фото с Telegram на каждый бой.
+    thumb = b""
+    try:
+        from game import vs_card as mog_vs_card
+
+        thumb = await asyncio.to_thread(mog_vs_card.prepare_thumb, raw)
+    except Exception:  # noqa: BLE001 — без миниатюры бой уйдёт текстом
+        log.exception("tournament thumb failed")
     st["photos"].append(
         {
             "file_id": file_id,
@@ -1820,6 +1829,7 @@ async def _tt_add_photo(msg: Message, bot: Bot, file_id: str) -> None:
             "tier": tier,
             "stats": stats,
             "hash": phash,
+            "thumb": thumb,
         }
     )
     st["order"].append(len(st["photos"]) - 1)
@@ -1893,6 +1903,43 @@ async def on_tt_pick(cb: CallbackQuery, bot: Bot) -> None:
     )
 
 
+async def _tt_tick(bot: Bot, status, done: int, total: int) -> None:
+    """Счётчик рендера: одна строка, которая правится на месте."""
+    if status is None:
+        return
+    try:
+        await bot.edit_message_text(
+            f"🎬 Рендерю постеры… {done}/{total}",
+            chat_id=status.chat.id,
+            message_id=status.message_id,
+        )
+    except Exception:  # noqa: BLE001 — «message is not modified» и прочее
+        pass
+
+
+async def _tt_safe_send(
+    bot: Bot, chat_id: int, text: str, *, parse_mode: str | None = None, photo=None
+) -> bool:
+    """Пост в ленту турнира с паузой и без падений на лимитах Telegram.
+
+    8 постов подряд — это 8 запросов в один чат: без паузы ловим 429 и теряем
+    часть сетки. Ошибку логируем и идём дальше: турнир важнее одного поста.
+    """
+    try:
+        if photo is not None:
+            await bot.send_photo(
+                chat_id, photo, caption=text, parse_mode=parse_mode
+            )
+        else:
+            await bot.send_message(chat_id, text, parse_mode=parse_mode)
+        return True
+    except Exception:  # noqa: BLE001 — сетка не должна падать из-за одного поста
+        log.exception("tournament post failed")
+        return False
+    finally:
+        await asyncio.sleep(0.6)
+
+
 @dp.callback_query(F.data == "tt:fight")
 async def on_tt_fight(cb: CallbackQuery, bot: Bot) -> None:
     """Играет сетку по текущему порядку и показывает чемпиона."""
@@ -1912,18 +1959,116 @@ async def on_tt_fight(cb: CallbackQuery, bot: Bot) -> None:
     await _tt_panel(
         bot,
         st,
-        mog_tt.result_text(rounds, champion, total=len(items)),
+        mog_tt.result_header(rounds, champion, total=len(items)),
         mog_tt.fight_keyboard(),
     )
+
+    # 🎬 Каждый бой — отдельный пост: VS-постер + два абзаца. Панель выше
+    # остаётся живой (под ней кнопки «Ещё раз»/«Закрыть»), поэтому посты идут
+    # в чат, а не в edit_message_text.
+    from aiogram.types import BufferedInputFile
+
+    from game import vs_card as mog_vs
+
+    chat_id = st["chat_id"]
+    rng = mog_tt._rng(mog_tt._seed_of(rounds))
+    battles_total = sum(1 for r in rounds for m in r if m[1] is not None)
+    battles_done = 0
+    # Мгновенная обратная связь: рендер постеров занимает пару секунд, и без
+    # живого счётчика человек решает, что бот умер.
+    status = None
+    try:
+        status = await bot.send_message(
+            chat_id, f"🎬 Рендерю постеры… 0/{battles_total}"
+        )
+    except Exception:  # noqa: BLE001 — статус не обязателен
+        log.exception("tt status failed")
+    for i, matches in enumerate(rounds):
+        title = mog_tt._round_title(i, len(rounds))
+        for a, b, w in matches:
+            if b is None:
+                await _tt_safe_send(
+                    bot, chat_id, mog_tt.bye_post(a, title), parse_mode="HTML"
+                )
+                continue
+            gap = abs(a["score"] - b["score"])
+            caption = f"<b>{title}</b> · MOG\n\n" + mog_tt.match_post_text(
+                a, b, w, rng=rng
+            )
+            card = None
+            if a.get("thumb") and b.get("thumb"):
+                try:
+                    card = await asyncio.to_thread(
+                        mog_vs.vs_card,
+                        a["thumb"],
+                        b["thumb"],
+                        round_title=title,
+                        slot_a=a["slot"],
+                        score_a=a["score"],
+                        slot_b=b["slot"],
+                        score_b=b["score"],
+                        winner="a" if w is a else "b",
+                        verdict=mog_tt.verdict_label(gap),
+                        gap=gap,
+                        note_a=mog_tt.top_note(a),
+                        note_b=mog_tt.top_note(b),
+                    )
+                except Exception:  # noqa: BLE001 — текст остаётся текстом
+                    log.exception("vs card failed")
+            if card:
+                ok = await _tt_safe_send(
+                    bot,
+                    chat_id,
+                    caption,
+                    parse_mode="HTML",
+                    photo=BufferedInputFile(card, filename="mog_vs.jpg"),
+                )
+                if ok:
+                    battles_done += 1
+                    await _tt_tick(bot, status, battles_done, battles_total)
+                    continue
+            await _tt_safe_send(bot, chat_id, caption, parse_mode="HTML")
+            battles_done += 1
+            await _tt_tick(bot, status, battles_done, battles_total)
+
+    if status is not None:
+        try:
+            await bot.delete_message(chat_id, status.message_id)
+        except Exception:  # noqa: BLE001 — статус мог уехать сам
+            pass
+
+    champ_caption = mog_tt.champion_text(champion, total=len(items), rounds=rounds)
+    champ_card = None
+    if champion.get("thumb"):
+        try:
+            champ_card = await asyncio.to_thread(
+                mog_vs.champion_card,
+                champion["thumb"],
+                slot=champion["slot"],
+                score=champion["score"],
+                tier=champion["tier"],
+                path=mog_tt.path_plain(rounds, champion),
+                crown=mog_tt.crown_line(champion),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("champion card failed")
+    if champ_card:
+        ok = await _tt_safe_send(
+            bot,
+            chat_id,
+            champ_caption,
+            parse_mode="HTML",
+            photo=BufferedInputFile(champ_card, filename="mog_champion.jpg"),
+        )
+        if ok:
+            return
     try:
         await bot.send_photo(
-            st["chat_id"],
-            champion["file_id"],
-            caption=mog_tt.champion_text(champion, total=len(items), rounds=rounds),
-            parse_mode="HTML",
+            chat_id, champion["file_id"], caption=champ_caption, parse_mode="HTML"
         )
     except Exception:  # noqa: BLE001 — фото могли удалить
         log.exception("champion photo failed")
+        await _tt_safe_send(bot, chat_id, champ_caption, parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "tt:reset")
