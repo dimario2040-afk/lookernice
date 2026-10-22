@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-22c-face-gate"
+APP_VERSION = "2026-10-22d-tag-face"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -3037,6 +3037,152 @@ async def on_consent(cb: CallbackQuery, bot: Bot) -> None:
             await _process_photo(cb.message, bot, raw, user=cb.from_user)
 
 
+# ---------------------------------------------------------------- «есть ли лицо»
+_NO_FACE_TEXT = (
+    "🙈 Лица не вижу — МОГать нечего.\n"
+    "Скрины документов, котов и пейзажей не оцениваю: пришли селфи или фото, "
+    "где человека видно."
+)
+_FACE_TTL = 10 * 60
+_FACE_CACHE_MAX = 300
+_face_cache: dict[str, tuple[float, bool | None]] = {}
+
+_FACE_PROMPT = (
+    "Look at the image. Answer with exactly one line, nothing else:\n"
+    "FACE: yes — if at least one human face is visible (any size, in profile, "
+    "on a poster or in a photo of a photo counts).\n"
+    "FACE: no — if there is no human face: text or document screenshot, animal, "
+    "food, landscape, object, blurred blob."
+)
+
+
+_DOC_THUMB = (224, 224)
+
+
+def _looks_like_document(raw: bytes) -> bool:
+    """Дешёвый локальный фильтр: страница текста / скрин документа, а не человек.
+
+    Режем ДО вызова VLM: скрин ворда не тратит ни квоту, ни секунды ожидания, и
+    вопрос «оценить?» по нему вообще не задаётся.
+
+    Признак: почти белый фон + нет цвета + немного «чернил». У настоящего фото
+    фон почти всегда с текстурой и оттенком, поэтому цифры расходятся в разы.
+    Обратного утверждения нет: True — почти наверняка документ, False — «не знаю».
+    Цена ошибки известна: студийный портрет на идеально белом фоне может попасть
+    под фильтр, и бот скажет «лица не вижу» — это лучше, чем разбор скрина ворда.
+    """
+    from PIL import Image
+
+    try:
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        img.thumbnail(_DOC_THUMB)
+    except Exception:  # noqa: BLE001 — не картинка/битый файл
+        return False
+    px = list(img.getdata())
+    n = len(px) or 1
+    white = dark = sat = 0
+    for r, g, b in px:
+        mx = r if r > g else g
+        if b > mx:
+            mx = b
+        mn = r if r < g else g
+        if b < mn:
+            mn = b
+        sat += mx - mn
+        lum = (r + g + b) / 3
+        if lum >= 232 and mx - mn <= 14:
+            white += 1
+        elif lum <= 100:
+            dark += 1
+    return (
+        white / n >= 0.55
+        and sat / n / 255 <= 0.02
+        and 0.004 <= dark / n <= 0.35
+    )
+
+
+def _face_verdict(raw: bytes) -> bool | None:
+    """Есть ли на фото человек. True/False — вердикт модели, None — не спросили.
+
+    Отдельный крошечный вызов (max_tokens=8), потому что вопрос «оценить?» надо
+    задавать только по фото с людьми. Вердикт кэшируется по отпечатку: тот же
+    снимок в одном чате не проверяется дважды.
+    """
+    import base64
+
+    from game import rolls as mog_rolls
+
+    key = mog_rolls.photo_hash(raw)
+    now = time.time()
+    hit = _face_cache.get(key)
+    if hit and now - hit[0] <= _FACE_TTL:
+        return hit[1]
+    verdict: bool | None = None
+    try:
+        resp = _vision_chat(
+            [
+                {"role": "system", "content": _FACE_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/jpeg;base64,"
+                                + base64.b64encode(raw).decode("utf-8")
+                            },
+                        },
+                        {"type": "text", "text": "FACE: yes or FACE: no?"},
+                    ],
+                },
+            ],
+            max_tokens=8,
+            temperature=0.0,
+        )
+        text, _finish = _extract_text(resp)
+        _rest, verdict = _take_face_flag(text)
+    except Exception:  # noqa: BLE001 — VLM лёг: не выключаем игру из-за этого
+        log.warning("face check failed, allowing photo")
+        verdict = None
+    for tok in [t for t, v in _face_cache.items() if now - v[0] > _FACE_TTL]:
+        _face_cache.pop(tok, None)
+    if len(_face_cache) >= _FACE_CACHE_MAX:
+        _face_cache.pop(min(_face_cache, key=lambda t: _face_cache[t][0]), None)
+    _face_cache[key] = (now, verdict)
+    return verdict
+
+
+async def _addressed_to_bot(msg: Message, bot: Bot) -> bool:
+    """В группе фото считаем адресованным боту только по явному сигналу.
+
+    Просто картинка в чате — не повод: люди кидают скрины, мемы и документы.
+    Адресовано = ответ на сообщение бота, @ник бота в подписи, открытый вызов на
+    бой или приглашение в арену (там флоу уже начался, тап был).
+    """
+    if msg.chat.type == "private":
+        return True
+    rt = getattr(msg, "reply_to_message", None)
+    if rt is not None and getattr(rt, "from_user", None) is not None and rt.from_user.is_bot:
+        return True
+    caption = (msg.caption or "").lower()
+    if caption:
+        uname = (await _bot_username(bot) or "").lower()
+        if uname and f"@{uname}" in caption:
+            return True
+    key = (msg.chat.id, msg.from_user.id)
+    invited = _pending_arena.get(key)
+    if invited and time.time() - invited <= _ARENA_PENDING_TTL:
+        return True
+    from game import db as mog_db
+
+    try:
+        if await mog_db.find_pending_battle(msg.chat.id, msg.from_user.id):
+            return True
+    except Exception:  # noqa: BLE001
+        log.exception("battle lookup failed")
+    return False
+
+
 # ---------------------------------------------------------------- «это в МОГ?»
 # В группе фото может быть просто фото: человека в отпуске, кота, счёта из бара.
 # Поэтому первый раз (раз в 6 часов на пару чат+человек) бот переспрашивает и
@@ -3140,6 +3286,11 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         await msg.answer("⚠️ Бот не настроен: нет TELEGRAM_TOKEN или MODEL_API_KEY в .env")
         return
 
+    # 🎯 В группе без адреса боту фото не трогаем вообще: ни скачивания, ни
+    # ответа. Иначе любая картинка в чате запускала разбор.
+    if not await _addressed_to_bot(msg, bot):
+        return
+
     # 📸 Скачиваем фото ДО проверки согласия — чтобы после кнопки «Согласен»
     # разбор стартовал сразу, без повторной отправки фото.
     try:
@@ -3159,7 +3310,17 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         return
 
     # 🤔 В группе сначала спрашиваем: это вообще в МОГ? Рамка + один тап.
+    # Спрашиваем ТОЛЬКО по фото с людьми: на скрин документа вопрос «оценить?»
+    # сам по себе выглядит поломкой. Сначала дешёвый локальный фильтр, потом
+    # крошечный вызов модели — так VLM не тратится на очевидные документы.
     if await _ask_wanted(msg):
+        # 🧾 Скрин документа отсекаем локально: ни вызова модели, ни вопроса.
+        if await asyncio.to_thread(_looks_like_document, raw):
+            await msg.reply(_NO_FACE_TEXT)
+            return
+        if await asyncio.to_thread(_face_verdict, raw) is False:
+            await msg.reply(_NO_FACE_TEXT)
+            return
         _ask_last[(msg.chat.id, msg.from_user.id)] = time.time()
         token = _ask_store(raw, msg.chat.id, msg.from_user.id)
         await msg.reply(
@@ -3283,6 +3444,12 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
     # из-за чего табло боя не совпадало с карточкой.
     score, tier = _mog_score_tier(raw)
 
+    # 🧾 Страница текста — не портрет. Режем локально и сразу: без VLM, без
+    # ролла, без закрытия боя. Это и есть «МОГ только по людям».
+    if await asyncio.to_thread(_looks_like_document, raw):
+        await msg.answer(_NO_FACE_TEXT)
+        return
+
     # 📸 Дедуп в рамках чата: та же картинка (перцептивный хэш) или буквально
     # тот же файл разбирается ровно один раз — иначе пересылка вниз по чату
     # запускает нейронку заново. Запись атомарная: при одновременной отправке
@@ -3341,11 +3508,7 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
                 await status.delete()
             except Exception:  # noqa: BLE001
                 pass
-            await msg.answer(
-                "🙈 Лица не вижу — МОГать нечего.\n"
-                "Скрины документов, котов и пейзажей не оцениваю: пришли селфи "
-                "или фото, где человека видно.",
-            )
+            await msg.answer(_NO_FACE_TEXT)
             # Фото не разобрано — снимаем отметку дедупа, чтобы повтор не ушёл
             # в «уже было», и не закрываем бой несуществующим баллом.
             try:
