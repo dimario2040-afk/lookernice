@@ -33,7 +33,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-22g-promo"
+APP_VERSION = "2026-10-22h-implied"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -809,20 +809,6 @@ def _remember_photo(user_id: int, raw: bytes, metrics_text: str, metrics: dict) 
     _pending_prune()
 
 
-# Фото, ждущие согласия: user_id -> (unix_ts, raw байты). TTL — чтобы бот не таскал
-# старые фото после отложенного нажатия «Согласен». Лимит — тот же PENDING_LIMIT.
-_CONSENT_PHOTO_TTL = 15 * 60
-_pending_consent: dict[int, tuple[float, bytes]] = {}
-
-
-def _stash_consent_photo(user_id: int, raw: bytes) -> None:
-    from game import config as mog_config
-
-    _pending_consent[user_id] = (time.time(), raw)
-    if len(_pending_consent) > mog_config.PENDING_LIMIT:
-        for old in list(_pending_consent.keys())[: len(_pending_consent) - mog_config.PENDING_LIMIT]:
-            _pending_consent.pop(old, None)
-
 # ---------------------------------------------------------------- бот
 dp = Dispatcher()
 BOT_ME_ID: int | None = None
@@ -859,15 +845,18 @@ async def cmd_start(msg: Message, bot: Bot) -> None:
         "А если хочешь жести — жми кнопку «📊 Подробный разбор»: "
         "там PSL-рейтинг, кости, failo/halo и план прокачки.\n\n"
         "Фото обрабатывается локально (MediaPipe) + нейронка. "
-        "Ничего не храню — файл удаляется сразу после анализа."
+        "Ничего не храню — файл удаляется сразу после анализа.\n\n"
+        "🔞 18+ и выдуманный балл, это не оценка внешности. "
+        "Зашёл и пользуешься — значит согласен, второй раз не спрошу. "
+        "Передумаешь — /forget сотрёт всё."
     )
-    # 🔞 Согласие спрашиваем ОДИН раз и МЕЛКО: строка кнопок под приветствием,
-    # без абзацев. Полный текст — только за кнопкой «договор».
-    rows = [
-        [InlineKeyboardButton(text="🏟 Тестовый турнир", callback_data="tt:new")]
-    ]
-    if not await _has_consent(msg.from_user.id):
-        rows += _consent_keyboard().inline_keyboard
+    # 🔞 Согласие подразумевается по факту использования: кнопки нет, отметка
+    # пишется молча (нужна как след, а не как шлагбаум).
+    try:
+        await _ensure_consent(msg, bot)
+    except Exception:  # noqa: BLE001 — отметка не должна ломать приветствие
+        log.exception("implied consent failed")
+    rows = [[InlineKeyboardButton(text="🏟 Тестовый турнир", callback_data="tt:new")]]
     await msg.answer(
         welcome, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
@@ -1213,9 +1202,7 @@ async def _start_duel_invite(msg: Message, bot: Bot, code: str) -> None:
             )
         ]
     ]
-    # Согласие — той же мелкой строкой, без отдельного сообщения-простыни.
-    if not await _has_consent(msg.from_user.id):
-        rows += _consent_keyboard().inline_keyboard
+    # Согласие подразумевается — отдельной строки с кнопкой здесь нет.
     await msg.answer(
         text,
         parse_mode="HTML",
@@ -1777,21 +1764,7 @@ async def _tt_open(msg: Message, bot: Bot, *, force_new: bool = False) -> None:
         return
     st = _tt_get(uid)
     if not st or force_new:
-        if not await _has_consent(uid):
-            _tournaments[uid] = {
-                "stage": "consent",
-                "photos": [],
-                "order": [],
-                "picked": None,
-                "chat_id": msg.chat.id,
-                "ts": time.time(),
-            }
-            await msg.answer(
-                "🔞 Это 18+ и выдуманный балл, а не оценка внешности.\n"
-                "Жми «Мне 18+» — и кидай фото. Подробности за кнопкой «Договор».",
-                reply_markup=_consent_keyboard(),
-            )
-            return
+        await _ensure_consent(msg, bot)
         st = {
             "stage": "collect",
             "photos": [],
@@ -3322,39 +3295,23 @@ async def _has_consent(user_id: int) -> bool:
     return bool(row and row["version"] == mog_legal.POLICY_VERSION)
 
 
-def _consent_keyboard() -> InlineKeyboardMarkup:
-    """Одна мелкая строка: «ок» + «договор» (текст политики — только по клику)."""
-    from game import legal as mog_legal
-
-    row = [
-        InlineKeyboardButton(
-            text="✅ ок, 18+", callback_data=f"consent:{mog_legal.POLICY_VERSION}"
-        )
-    ]
-    if PUBLIC_BASE_URL:
-        row.append(InlineKeyboardButton(text="📄 договор", url=f"{PUBLIC_BASE_URL}/legal"))
-    return InlineKeyboardMarkup(inline_keyboard=[row])
-
-
 async def _ensure_consent(msg: Message, bot: Bot, intro: str = "") -> bool:
-    """Согласие (152-ФЗ). Нет — один мелкий тап, без простыни текста.
+    """Согласие (152-ФЗ) подразумевается: пользуется ботом — значит принял.
 
-    Никаких абзацев: человек видит только «18+» и две кнопки. Полный текст
-    политики живёт за кнопкой «договор» (страница /legal), в чат не вываливается.
+    Шлагбаума нет: ни кнопки, ни отдельного сообщения. Молча пишем отметку с
+    версией политики (след для аудита) и всегда возвращаем True. Текст политики
+    живёт на /legal, отзыв — /forget.
     """
     from game import db as mog_db
     from game import legal as mog_legal
 
-    row = await mog_db.get_consent(msg.from_user.id)
-    if row and row["version"] == mog_legal.POLICY_VERSION:
+    if await _has_consent(msg.from_user.id):
         return True
-    await msg.answer(
-        "18+",
-        reply_markup=_consent_keyboard(),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    return False
+    try:
+        await mog_db.record_consent(msg.from_user.id, mog_legal.POLICY_VERSION)
+    except Exception:  # noqa: BLE001 — след не должен блокировать обработку
+        log.exception("implied consent not stored")
+    return True
 
 
 @dp.callback_query(F.data.startswith("consent:"))
@@ -3378,23 +3335,8 @@ async def on_consent(cb: CallbackQuery, bot: Bot) -> None:
         )
     except Exception:  # noqa: BLE001 — сообщение старое/без клавиатуры
         pass
-    # 🏟 Если человек начал турнир и упёрся в согласие — сразу открываем сбор,
-    # чтобы не заставлять его второй раз жать /tournament.
-    st = _tournaments.get(cb.from_user.id)
-    if st and st.get("stage") == "consent":
-        from game import tournament as mog_tt
-
-        st.update(stage="collect", ts=time.time(), album=[])
-        await _tt_panel(
-            bot, st, mog_tt.collect_text(0), mog_tt.collect_keyboard(0)
-        )
-    # 📸 Фото, присланное до согласия, — считаем сразу, от имени ЧЕЛОВЕКА
-    # (cb.message.from_user — это бот, поэтому передаём юзера явно).
-    entry = _pending_consent.pop(cb.from_user.id, None)
-    if entry:
-        stored_at, raw = entry
-        if time.time() - stored_at <= _CONSENT_PHOTO_TTL and raw:
-            await _process_photo(cb.message, bot, raw, user=cb.from_user)
+    # Кнопка могла остаться в старом сообщении — просто фиксируем и убираем.
+    # Новые сообщения её не показывают: согласие считается по факту использования.
 
 
 # ---------------------------------------------------------------- «есть ли лицо»
@@ -3663,11 +3605,9 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         await msg.answer("Не смог скачать фото. Отправь ещё раз 📸")
         return
 
-    # 🔞 Без согласия на обработку ПДн фото не обрабатываем — но запоминаем
-    # байты: нажатие «Согласен» запустит обработку этого фото автоматически.
-    if not await _ensure_consent(msg, bot):
-        _stash_consent_photo(msg.from_user.id, raw)
-        return
+    # 🔞 Согласие подразумевается: шлагбаума нет, обработку не блокируем.
+    # Отметку пишем молча — она нужна как след, отзыв живёт в /forget.
+    await _ensure_consent(msg, bot)
 
     # 🤔 В группе сначала спрашиваем: это вообще в МОГ? Рамка + один тап.
     # Спрашиваем ТОЛЬКО по фото с людьми: на скрин документа вопрос «оценить?»
