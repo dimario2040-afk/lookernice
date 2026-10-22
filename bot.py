@@ -29,7 +29,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-22b-ask-gate"
+APP_VERSION = "2026-10-22c-face-gate"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -484,14 +484,27 @@ def _sanitize_roast(text: str) -> str:
     return _escape_bare(text)
 
 
-def _extract_roast(resp, fallback_hint: str = "") -> str:
-    """Достаёт текст из ответа VLM и прогоняет через санитайзер + детектор мусора."""
-    finish = ""
-    try:
-        text = (resp.choices[0].message.content or "").strip()
-        finish = resp.choices[0].finish_reason or ""
-    except Exception:  # noqa: BLE001
-        text = ""
+def _take_face_flag(text: str) -> tuple[str, bool | None]:
+    """Достаёт служебную строку `FACE: yes|no` из начала ответа модели.
+
+    None — модель не ответила внятно (упала, другой провайдер, мусор): считаем
+    «неизвестно» и НЕ блокируем разбор, иначе отказ VLM выключил бы игру целиком.
+    """
+    import re
+
+    if not text:
+        return text, None
+    m = re.search(r"face\s*[:\-]\s*(yes|no|да|нет|true|false)", text[:200], re.I)
+    if not m:
+        return text, None
+    face = m.group(1).lower() in ("yes", "да", "true")
+    rest = text[: m.start()] + text[m.end() :]
+    rest = re.sub(r"^[\s\-—:.,!)]+", "", rest).strip()
+    return rest, face
+
+
+def _finish_roast(text: str, finish: str = "") -> str:
+    """Санитайзер + детектор пустого ответа. Общий для всех слоёв разбора."""
     text = _sanitize_roast(text)
     log.info("roast: finish=%s chars=%d", finish, len(text))
     # если после чистки ничего осмысленного не осталось — fallback
@@ -501,6 +514,13 @@ def _extract_roast(resp, fallback_hint: str = "") -> str:
             "Попробуй другое фото: прямой ракурс, дневной свет, без очков."
         )
     return text
+
+
+def _extract_roast(resp, fallback_hint: str = "") -> str:
+    """Достаёт текст из ответа VLM и прогоняет через санитайзер + детектор мусора."""
+    text, finish = _extract_text(resp)
+    text, _face = _take_face_flag(text)
+    return _finish_roast(text, finish)
 
 
 def _vision_chat(messages: list, *, max_tokens: int, temperature: float = 0.9):
@@ -654,11 +674,13 @@ SIMPLE_PROMPT = """Ты — друг-карикатурист: описывае�
 Жесть, цифры и диагнозы — НЕ твоя задача, их выдаст другой режим по кнопке.
 Если биометрия недоступна — смотри только фото.
 
-ГЛАВНОЕ ПРАВИЛО: описывай смешно ЛЮБОЕ фото. Даже если это НЕ лицо (кот, еда,
-пейзаж, мем, скриншот, размытое пятно, палец на камере) — СДЕЛАЙ ВИД, что это
-лицо героя, и опиши его как лицо: «кости», «взгляд», «характер», «скулы».
-Чем абсурднее исходник, тем смешнее. НИКОГДА не пиши «это не лицо» и не
-отказывайся — обыграй абсурд как фишку героя.
+ПЕРВАЯ СТРОКА ОТВЕТА — ровно одно из двух, без пояснений:
+FACE: yes — на фото есть человеческое лицо (хотя бы одно, хотя бы в профиль).
+FACE: no — лица нет: скриншот документа или текста, кот, еда, пейзаж, предмет,
+палец на камере, силуэт без лица, мем без людей.
+
+Если FACE: no — после этой строки НИЧЕГО не пиши. Разбор не нужен.
+Если FACE: yes — дальше обычный разбор по схеме ниже.
 """
 
 SIMPLE_PROMPT_SOFT = """Ты — автор добрых дружеских шаржей для развлекательного теста.
@@ -666,8 +688,8 @@ SIMPLE_PROMPT_SOFT = """Ты — автор добрых дружеских ша
 комплименты с юмором, яркие сравнения с героями фильмов и животными.
 Простыми словами, без терминов и цифр. Два абзаца, русский язык.
 Описывай только то, что видно на фото, ничего не выдумывай.
-Даже если это не лицо (кот, еда, предмет) — сделай вид, что это лицо героя,
-и опиши смешно. Никогда не отказывайся.
+Первая строка ответа — ровно FACE: yes или FACE: no (есть ли на фото лицо
+человека). Если лица нет — только эта строка, без текста.
 """
 
 
@@ -685,7 +707,7 @@ def _simple_call(system_prompt: str, photo_b64: str, metrics_text: str):
                 {
                     "type": "text",
                     "text": f"Замеры для ориентира (не озвучивай цифры): {metrics_text}\n\n"
-                    "Опиши человека простыми словами по схеме из системного промпта.",
+                    "Не забудь первую строку FACE: yes|no, потом — разбор по схеме.",
                 },
             ],
         },
@@ -703,7 +725,7 @@ def _extract_text(resp) -> tuple[str, str]:
         return "", ""
 
 
-def analyze_simple(photo_bytes: bytes, metrics_text: str) -> str:
+def analyze_simple(photo_bytes: bytes, metrics_text: str) -> tuple[str, bool | None]:
     """Короткий разбор простыми словами (первый слой выдачи).
 
     Китайский фильтр (1301) иногда режет дерзкий промпт — тогда повторяем
@@ -725,8 +747,12 @@ def analyze_simple(photo_bytes: bytes, metrics_text: str) -> str:
                 raise
         else:
             raise
-    text = _extract_roast(resp)
-    return text
+    content, finish = _extract_text(resp)
+    content, face = _take_face_flag(content)
+    if face is False:
+        log.info("no face on photo -> not scoring")
+        return "", False
+    return _finish_roast(content, finish), face
 
 
 # Контекст для кнопок: user_id -> (photo_bytes, metrics_text, metrics_dict).
@@ -3287,9 +3313,6 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
     kb = await _card_keyboard_for(msg.from_user.id)
     battle_view: dict | None = None
     try:
-        # ⚔️ ДУЭЛЬ: фото закрывает бой (общая логика с веткой повторов).
-        battle_view = await _resolve_chat_battle(msg, score)
-
         # 1. Локальная биометрия (в треде, чтобы не блочить loop).
         # В лайт-режиме хостинга её нет — сразу идём к нейронке по фото.
         if BIOMETRY_AVAILABLE:
@@ -3307,8 +3330,32 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
             metrics = {"face_found": False, "error": "biometry_unavailable"}
             metrics_text = format_metrics(metrics)
 
-        # 2. Первый слой: разбор простыми словами (тоже в треде)
-        simple = await asyncio.to_thread(analyze_simple, raw, metrics_text)
+        # 2. Первый слой: разбор простыми словами + проверка «есть ли лицо»
+        #    одним и тем же вызовом (отдельный классификатор удвоил бы квоту).
+        simple, face_ok = await asyncio.to_thread(analyze_simple, raw, metrics_text)
+
+        # 🙈 Нет лица — не МОГаем. Скрин документа, кот или пейзаж в чате не
+        # должны превращаться в «разбор внешности»: это выглядит поломкой.
+        if face_ok is False:
+            try:
+                await status.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            await msg.answer(
+                "🙈 Лица не вижу — МОГать нечего.\n"
+                "Скрины документов, котов и пейзажей не оцениваю: пришли селфи "
+                "или фото, где человека видно.",
+            )
+            # Фото не разобрано — снимаем отметку дедупа, чтобы повтор не ушёл
+            # в «уже было», и не закрываем бой несуществующим баллом.
+            try:
+                await mog_db.forget_photo(msg.chat.id, phash)
+            except Exception:  # noqa: BLE001
+                log.exception("forget photo failed")
+            return
+
+        # ⚔️ ДУЭЛЬ: фото закрывает бой — только после того, как лицо подтвердилось.
+        battle_view = await _resolve_chat_battle(msg, score)
 
         # Запоминаем контекст для кнопки "подробный разбор"
         _remember_photo(msg.from_user.id, raw, metrics_text, metrics)
