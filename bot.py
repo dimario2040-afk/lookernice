@@ -11,8 +11,12 @@ import logging
 import math
 import os
 import random
+import re
+import secrets
 import tempfile
 import time
+
+from urllib.parse import quote
 
 # Тяжёлая биометрия — ОПЦИОНАЛЬНА: на free-хостинге (Render, 512MB RAM)
 # mediapipe не влезет, и бот должен работать без него (только VLM по фото).
@@ -29,7 +33,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-22f-teal"
+APP_VERSION = "2026-10-22g-promo"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -45,6 +49,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from game import palette as pal  # noqa: E402  (общая бирюзовая палитра картинок)
+from game.textfmt import fmt as _fmt  # noqa: E402  (5.86, а не 5.8636)
+from game.textfmt import verdict_line as _verdict_line  # noqa: E402
 from game.config import PUBLIC_ERROR  # noqa: E402  (после load_dotenv — конфиг читает ENV)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -305,6 +311,11 @@ lower third, bigonial width, zygos, anti-fraud (ракурс/свет), softmaxx
 
 Тир определяй СТРОГО по числу, без натяжек: ниже 2.5 = sub-5/LTN,
 2.5-3.2 = MTN, 3.3-3.9 = HTN, 4.0+ = Chad. Число 2.2 — это LTN, а не MTN.
+
+ГРАНИЦЫ (жёстко): никаких шуток про расу, национальность, религию,
+инвалидность, здоровье, возраст, ориентацию и «дефекты» внешности.
+Про вес и кожу говори ТОЛЬКО как про то, что правится (отёки, сухость, стрижка),
+без унижения человека. Тема самоповреждения запрещена полностью.
 
 Формат ответа (строго, на русском):
 1. 💀 ВЕРДИКТ: PSL X.X — тир (sub-5/LTN/MTN/HTN/Chadlite/Chad) + одна жёсткая фраза.
@@ -675,6 +686,11 @@ SIMPLE_PROMPT = """Ты — друг-карикатурист: описывае�
 Жесть, цифры и диагнозы — НЕ твоя задача, их выдаст другой режим по кнопке.
 Если биометрия недоступна — смотри только фото.
 
+СТОП-ЛИСТ (нарушил — ответ брак): раса, национальность, религия, инвалидность,
+здоровье, вес, возраст, ориентация, любые «дефекты» внешности. Бей по стилю,
+вайбу, одежде, «ауре», выражению лица и подаче — это смешно и никого не травит.
+Тема самоповреждения запрещена полностью.
+
 ПЕРВАЯ СТРОКА ОТВЕТА — ровно одно из двух, без пояснений:
 FACE: yes — на фото есть человеческое лицо (хотя бы одно, хотя бы в профиль).
 FACE: no — лица нет: скриншот документа или текста, кот, еда, пейзаж, предмет,
@@ -689,6 +705,8 @@ SIMPLE_PROMPT_SOFT = """Ты — автор добрых дружеских ша
 комплименты с юмором, яркие сравнения с героями фильмов и животными.
 Простыми словами, без терминов и цифр. Два абзаца, русский язык.
 Описывай только то, что видно на фото, ничего не выдумывай.
+Никаких шуток про расу, религию, здоровье, вес, возраст, ориентацию и
+«дефекты» внешности — только стиль, вайб и одежда.
 Первая строка ответа — ровно FACE: yes или FACE: no (есть ли на фото лицо
 человека). Если лица нет — только эта строка, без текста.
 """
@@ -824,6 +842,15 @@ async def cmd_start(msg: Message, bot: Bot) -> None:
     if payload.startswith("duel_"):
         await _start_duel_invite(msg, bot, payload[len("duel_"):])
         return
+    # ?start=s_<src> — метка канала. Без неё посевы не посчитать.
+    src = _start_source(payload)
+    if src:
+        try:
+            from game import db as mog_db
+
+            await mog_db.add_start(msg.from_user.id, src)
+        except Exception:  # noqa: BLE001 — метка не должна ломать приветствие
+            log.exception("start source failed")
 
     welcome = (
         "💀 <b>PSL-бот на связи.</b>\n\n"
@@ -846,6 +873,16 @@ async def cmd_start(msg: Message, bot: Bot) -> None:
     )
 
 
+def _start_source(payload: str) -> str:
+    """?start=s_tiktok1 → tiktok1. Мусор и пустое → "" (direct)."""
+    raw = (payload or "").strip()
+    for prefix in ("s_", "src_", "m_"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    return re.sub(r"[^A-Za-z0-9_-]", "", raw)[:32]
+
+
 @dp.message(Command("help"))
 async def cmd_help(msg: Message) -> None:
     await msg.answer(
@@ -861,6 +898,7 @@ async def cmd_help(msg: Message) -> None:
         "(оба балла, кто победил, разрыв).\n"
         "🏆 Арена до 8: /arena в группе.\n"
         "🏟 Тестовый турнир (соло, до 8 фото): /tournament в личке со мной.\n"
+        "🖼 Карточка в сторис (1080×1920): /card или кнопка под результатом.\n"        "🧹 Забыть мои баллы и согласие: /forget.\n"
         "🎒 Артефакты в бою: за Stars, буст до +0.5 (есть 🎁 бесплатный раз в день).\n"
         "🔞 18+ · правила и согласие на обработку данных — /legal",
     )
@@ -933,7 +971,7 @@ async def cmd_mog(msg: Message) -> None:
     if opponent is None:
         text = (
             f"⚔️ <b>{_esc(challenger['name'])}</b> бросает открытый вызов!\n"
-            f"Его МОГ: <b>{c_score:.4f}</b>\n\n"
+            f"Его МОГ: <b>{_fmt(c_score)}</b>\n\n"
             + _photo_cta(addressed=False)
         )
         kb = _duel_keyboard(battle_id, open_challenge=True)
@@ -941,7 +979,7 @@ async def cmd_mog(msg: Message) -> None:
         text = (
             f"⚔️ <b>{_esc(challenger['name'])}</b> вызывает <b>{_esc(opponent['name'])}</b> "
             "на МОГ-БАТТЛ!\n"
-            f"Счёт вызывающего: <b>{c_score:.4f}</b>\n\n"
+            f"Счёт вызывающего: <b>{_fmt(c_score)}</b>\n\n"
             f"👉 <b>{_esc(opponent['name'])}</b>, твой ход:\n"
             + _photo_cta(addressed=True)
         )
@@ -970,6 +1008,7 @@ def _card_keyboard(credits: dict[str, int] | None = None) -> InlineKeyboardMarku
             [InlineKeyboardButton(text=reroll_label, callback_data="reroll")],
             [InlineKeyboardButton(text=studio_label, callback_data="studio")],
             [InlineKeyboardButton(text="🎁 Подарить", callback_data="gift")],
+            [InlineKeyboardButton(text="🖼 Карточка в сторис", callback_data="card:make")],
             [InlineKeyboardButton(text="📊 Подробный разбор", callback_data="full_roast")],
             [InlineKeyboardButton(text="🎯 Слабые места (неон)", callback_data="weakspots")],
             [InlineKeyboardButton(text="🧬 Замеры (тех)", callback_data="metrics")],
@@ -1038,7 +1077,7 @@ async def on_duel_accept(cb: CallbackQuery) -> None:
     their = float((battle or {}).get("challenger_score") or 0.0)
     await cb.message.answer(
         f"⚔️ <b>{_esc(user['name'])}</b> принял вызов.\n"
-        f"Балл соперника: <b>{their:.4f}</b>\n\n" + _photo_cta(addressed=True),
+        f"Балл соперника: <b>{_fmt(their)}</b>\n\n" + _photo_cta(addressed=True),
         parse_mode="HTML",
     )
 
@@ -1067,7 +1106,7 @@ async def on_duel_new(cb: CallbackQuery) -> None:
     their = float((battle or {}).get("challenger_score") or 0.0)
     await cb.message.answer(
         f"⚔️ <b>{_esc(challenger['name'])}</b> бросает открытый вызов!\n"
-        f"Его МОГ: <b>{their:.4f}</b>\n\n" + _photo_cta(addressed=False),
+        f"Его МОГ: <b>{_fmt(their)}</b>\n\n" + _photo_cta(addressed=False),
         reply_markup=_duel_keyboard(battle_id, open_challenge=True),
         parse_mode="HTML",
     )
@@ -1472,13 +1511,13 @@ async def _apply_arena_photo(msg: Message, bot: Bot, score: float, tier: str) ->
         await _arena_refresh(bot, arena["id"])
         if code == "joined":
             await msg.reply(
-                f"⚔️ Ты в арене! Твой МОГ: <b>{score:.4f}</b> · {tier}. "
+                f"⚔️ Ты в арене! Твой МОГ: <b>{_fmt(score)}</b> · {tier}. "
                 "Ждём остальных 👇",
                 parse_mode="HTML",
             )
         else:
             await msg.reply(
-                f"♻️ Балл в арене обновлён: <b>{score:.4f}</b> · {tier}.",
+                f"♻️ Балл в арене обновлён: <b>{_fmt(score)}</b> · {tier}.",
                 parse_mode="HTML",
             )
     except Exception:  # noqa: BLE001 — арена не должна ронять обычный разбор
@@ -1747,7 +1786,11 @@ async def _tt_open(msg: Message, bot: Bot, *, force_new: bool = False) -> None:
                 "chat_id": msg.chat.id,
                 "ts": time.time(),
             }
-            await msg.answer("18+", reply_markup=_consent_keyboard())
+            await msg.answer(
+                "🔞 Это 18+ и выдуманный балл, а не оценка внешности.\n"
+                "Жми «Мне 18+» — и кидай фото. Подробности за кнопкой «Договор».",
+                reply_markup=_consent_keyboard(),
+            )
             return
         st = {
             "stage": "collect",
@@ -2223,15 +2266,15 @@ async def _do_reroll(msg: Message, user_id: int) -> None:
         await msg.answer_photo(
             BufferedInputFile(card, filename="mog_card.jpg"),
             caption=(
-                f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
-                f"🔄 Реролл: было {prev:.4f} → стало <b>{score:.4f}</b> {arrow}"
+                f"🎲 <b>МОГ {_fmt(score)} · {tier}</b>\n"
+                f"🔄 Реролл: было {_fmt(prev)} → стало <b>{_fmt(score)}</b> {arrow}"
             ),
             parse_mode="HTML",
             reply_markup=await _card_keyboard_for(user_id),
         )
     except Exception:  # noqa: BLE001
         log.exception("reroll card failed")
-        await msg.answer(f"🔄 Реролл: было {prev:.4f} → стало {score:.4f} ({tier})")
+        await msg.answer(f"🔄 Реролл: было {_fmt(prev)} → стало {_fmt(score)} ({tier})")
 
 
 # ------------------------------------------------------- ванити-Студия (35 ⭐)
@@ -2280,7 +2323,7 @@ async def _do_studio(msg: Message, user_id: int) -> None:
         await msg.answer_photo(
             BufferedInputFile(card, filename="mog_studio.jpg"),
             caption=(
-                f"🎨 <b>MOG STUDIO · {score:.4f} · {tier}</b>\n"
+                f"🎨 <b>MOG STUDIO · {_fmt(score)} · {tier}</b>\n"
                 "Ретушь + золотая рамка. Чистая ванити — балл не менялся."
             ),
             parse_mode="HTML",
@@ -2417,7 +2460,7 @@ _MOG_PUNCHLINES = (
     "Счёт зафиксирован нотариусом выдуманных наук. Апелляции принимаются только звёздами.",
     "Эксперты разошлись во мнениях, но сошлись в баре. Твой балл уже обсуждают без тебя.",
     "Замеры проведены линейкой, купленной на сдачу. Погрешность спишем на харизму.",
-    "Результат заверен печатью «примерно». Пересдача — завтра, с другого ракурса.",
+    "Результат заверен печатью «примерно». Кидай второе фото и держи стрик, а не жди до завтра.",
     "Алгоритм трижды перепроверил и один раз присвистнул. Дальше — только легенда.",
     "Протокол подписан, свидетели подкуплены комплиментами. Балл обжалованию не подлежит.",
     "Коллегия псевдоучёных голосовала дважды: второй раз — чтобы поржать. Вердикт устоял.",
@@ -2445,7 +2488,7 @@ def _mog_tag(photo_bytes: bytes, score: float | None = None, tier: str | None = 
         int(hashlib.sha256(photo_bytes).hexdigest(), 16) % len(_MOG_PUNCHLINES)
     ]
     return (
-        f"\n\n🎲 <b>МОГ: {score:.4f} · {tier}</b>\n{punch}\n"
+        f"\n\n🎲 <b>МОГ: {_fmt(score)} · {tier}</b>\n{punch}\n"
         f"<i>{mog_config.DISCLAIMER}</i>"
     )
 
@@ -2723,7 +2766,7 @@ def _arena_board_image(players: list[dict]) -> bytes | None:
         draw.text((110, y + 2), name, font=f_name, fill=pal.INK)
         draw.text((110, y + 36), str(p.get("tier") or ""), font=f_tier, fill=pal.MUTED)
 
-        sc = f"{p['score']:.4f}"
+        sc = f"{_fmt(p['score'])}"
         try:
             sw = draw.textbbox((0, 0), sc, font=f_score)[2]
         except Exception:  # noqa: BLE001
@@ -2757,21 +2800,21 @@ async def _send_mog_card(
         you, foe = battle["you_score"], battle["foe_score"]
         gap = abs(you - foe)
         if battle.get("draw"):
-            head = f"🤝 <b>НИЧЬЯ</b> · {you:.4f} vs {foe:.4f}"
+            head = f"🤝 <b>НИЧЬЯ</b> · {_fmt(you)} vs {_fmt(foe)}"
         elif battle.get("you_won"):
             head = (
                 f"👑 <b>ПОБЕДА</b> над {_h(battle['foe_name'])} · "
-                f"{you:.4f} vs {foe:.4f} (+{gap:.4f})"
+                f"{_fmt(you)} vs {_fmt(foe)} (+{_fmt(gap)})"
             )
         else:
             head = (
                 f"💀 <b>ПРОИГРЫШ</b> от {_h(battle['foe_name'])} · "
-                f"{you:.4f} vs {foe:.4f} (-{gap:.4f})"
+                f"{_fmt(you)} vs {_fmt(foe)} (-{_fmt(gap)})"
             )
-        caption = f"{head}\n🎲 МОГ {score:.4f} · {tier}\n😏 Табло на картинке — перешли в чат"
+        caption = f"{head}\n🎲 МОГ {_fmt(score)} · {tier}\n😏 Табло на картинке — перешли в чат"
     else:
         caption = (
-            f"🎲 <b>МОГ {score:.4f} · {tier}</b>\n"
+            f"🎲 <b>МОГ {_fmt(score)} · {tier}</b>\n"
             "😏 Печать стоит — кинь другу"
         )
     card: bytes | None = None
@@ -2791,6 +2834,126 @@ async def _send_mog_card(
         await msg.answer(caption, parse_mode="HTML")
         return False
 
+
+# ───────────────────────── карточка для сторис (1080×1920) ─────────────────
+# Кэш собранных карточек: кнопка «📥 Файлом» отдаёт тот же байт-в-байт файл без
+# повторного рендера. 15 минут и максимум 40 штук — иначе это утечка RAM.
+_story_cache: dict[str, tuple[float, bytes]] = {}
+_STORY_TTL = 15 * 60
+_STORY_MAX = 40
+
+
+def _story_keep(card: bytes) -> str:
+    token = secrets.token_urlsafe(8)
+    now = time.time()
+    for old in [k for k, (ts, _b) in _story_cache.items() if now - ts > _STORY_TTL]:
+        _story_cache.pop(old, None)
+    while len(_story_cache) >= _STORY_MAX:
+        _story_cache.pop(next(iter(_story_cache)), None)
+    _story_cache[token] = (now, card)
+    return token
+
+
+def _streak_line(streak: int) -> str:
+    """Строка про серию дней — только когда есть что показать."""
+    if streak < 2:
+        return ""
+    if streak >= 3:
+        return f"\n🔥 Стрик {streak} дн. подряд — <b>MYTHIC</b>. Не рви серию."
+    return f"\n🔥 Стрик {streak} дн. подряд. Завтра третий — и он даёт MYTHIC."
+
+
+async def _send_story_card(msg: Message, user) -> bool:
+    """Вертикальная карточка из последнего разбора: фото, балл, тир, вердикт."""
+    from game import db as mog_db
+    from game import share_card as mog_share
+
+    data = _pending_photo(user.id)
+    try:
+        roll = await mog_db.last_roll(user.id)
+    except Exception:  # noqa: BLE001 — без БД карточку не из чего собрать
+        log.exception("story: last_roll failed")
+        roll = None
+    if not data or not roll:
+        await msg.answer(
+            "📸 Карточку собираю из последнего разбора: пришли фото — "
+            "и она появится под результатом."
+        )
+        return False
+    score = float(roll["score"])
+    tier = str(roll.get("tier") or "")
+    line = _verdict_line(roll.get("roast") or "") or random.choice(_MOG_PUNCHLINES)
+    username = getattr(user, "username", "") or ""
+    handle = f"@{username}" if username else (getattr(user, "first_name", "") or "мог без имени")
+    bot_name = _BOT_USERNAME or "lookernice_bot"
+    link = f"t.me/{bot_name}?start=s_story"
+    try:
+        card = await asyncio.to_thread(
+            mog_share.share_card,
+            data[0],
+            score=score,
+            tier=tier,
+            verdict=line,
+            handle=handle,
+            link=link,
+        )
+    except Exception:  # noqa: BLE001 — рендер не должен ронять ответ
+        log.exception("story card render failed")
+        await msg.answer("🖼 Не смог собрать карточку — попробуй ещё раз.")
+        return False
+    token = _story_keep(card)
+    share_url = (
+        "https://t.me/share/url?url="
+        + quote(f"https://{link}", safe="")
+        + "&text="
+        + quote(f"Мой МОГ {_fmt(score)} · {tier}. А твой?", safe="")
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="↗️ Переслать другу", url=share_url)],
+            [
+                InlineKeyboardButton(
+                    text="📥 Файлом (без сжатия)", callback_data=f"card:file:{token}"
+                )
+            ],
+        ]
+    )
+    await msg.answer_photo(
+        BufferedInputFile(card, filename="mog_story.jpg"),
+        caption=(
+            f"🖼 <b>МОГ {_fmt(score)} · {tier}</b>\n"
+            "1080×1920 — ровно под сторис. Сохрани и выложи."
+        ),
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    return True
+
+
+@dp.message(Command("card", "сторис"))
+async def cmd_card(msg: Message) -> None:
+    """Карточка для сторис по последнему разбору."""
+    await _send_story_card(msg, msg.from_user)
+
+
+@dp.callback_query(F.data == "card:make")
+async def on_card_make(cb: CallbackQuery) -> None:
+    await cb.answer("Собираю карточку…")
+    await _send_story_card(cb.message, cb.from_user)
+
+
+@dp.callback_query(F.data.startswith("card:file:"))
+async def on_card_file(cb: CallbackQuery) -> None:
+    token = (cb.data or "").split(":", 2)[-1]
+    item = _story_cache.get(token)
+    if not item or time.time() - item[0] > _STORY_TTL:
+        await cb.answer("Карточка устарела — собери заново.", show_alert=True)
+        return
+    await cb.answer("Отправляю файлом…")
+    await cb.message.answer_document(
+        BufferedInputFile(item[1], filename="mog_story.jpg"),
+        caption="🖼 Карточка файлом — без сжатия Telegram.",
+    )
 
 async def _resolve_duel_link(msg: Message, bot: Bot, score: float) -> None:
     """Если юзер принял вызов по ссылке — считает бой и разсылает табло обоим.
@@ -2889,15 +3052,15 @@ def _battle_bar(W: int, H: int, battle: dict):
     won = bool(battle.get("you_won"))
     accent = pal.MINT if won else (pal.MUTED if draw_flag else pal.DIM)
 
-    you_s = f'{battle["you_score"]:.4f}'
-    foe_s = f'{battle["foe_score"]:.4f}'
+    you_s = f'{_fmt(battle["you_score"])}'
+    foe_s = f'{_fmt(battle["foe_score"])}'
     margin = abs(battle["you_score"] - battle["foe_score"])
     if draw_flag:
         verdict = "НИЧЬЯ"
     elif won:
-        verdict = f"ПОБЕДА  +{margin:.4f}"
+        verdict = f"ПОБЕДА  +{_fmt(margin)}"
     else:
-        verdict = f"ПРОИГРЫШ  -{margin:.4f}"
+        verdict = f"ПРОИГРЫШ  -{_fmt(margin)}"
 
     unit = min(W, H)
     probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
@@ -2993,7 +3156,7 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str, battle: dict | None 
             log.exception("battle bar failed")
             banner_h = 0
     color = _neon_color(int(round(score / 10.0 * 100)))
-    lab, sc, ti = "МОГ", f"{score:.4f}", tier.upper()
+    lab, sc, ti = "МОГ", f"{_fmt(score)}", tier.upper()
 
     # Печать ≈ 34% короткой стороны, но не больше 52% (иначе на миниатюре
     # закрывает лицо) и не меньше 22% (иначе нечитаемо). Всё — доли, не px.
@@ -3081,6 +3244,56 @@ def _mog_stamp(photo_bytes: bytes, score: float, tier: str, battle: dict | None 
     buf = io.BytesIO()
     out.convert("RGB").save(buf, "JPEG", quality=90)
     return buf.getvalue()
+
+
+@dp.message(Command("src", "sources"))
+async def cmd_src(msg: Message) -> None:
+    """Счётчик входов по меткам ?start=s_<src>. Только владельцу."""
+    owners = {int(x) for x in re.findall(r"\d+", os.getenv("OWNER_IDS", ""))}
+    if msg.from_user.id not in owners:
+        return
+    from game import db as mog_db
+
+    try:
+        rows = await mog_db.start_counts(20)
+    except Exception:  # noqa: BLE001
+        log.exception("start_counts failed")
+        await msg.answer("Не смог прочитать источники.")
+        return
+    if not rows:
+        await msg.answer(
+            "Пока никто не пришёл по метке.\n"
+            "Ссылка для посева: <code>t.me/lookernice_bot?start=s_tiktok1</code>",
+            parse_mode="HTML",
+        )
+        return
+    lines = ["📊 <b>Источники /start</b>", ""]
+    for row in rows:
+        lines.append(
+            f"<code>{_esc(str(row['src']))}</code> — {row['users']} чел. "
+            f"({row['starts']} входов)"
+        )
+    await msg.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("forget", "забудь"))
+async def cmd_forget(msg: Message) -> None:
+    """«Забудь меня»: баллы, история, согласие. Фото и так не хранятся."""
+    from game import db as mog_db
+
+    try:
+        gone = await mog_db.forget_user(msg.from_user.id)
+    except Exception:  # noqa: BLE001
+        log.exception("forget_user failed")
+        await msg.answer("Не смог стереть — напиши в поддержку из /legal.")
+        return
+    await msg.answer(
+        "🧹 Готово. Удалил записей: "
+        f"{sum(gone.values())}.\n"
+        "Фото никогда не хранились — только баллы и хеши.\n"
+        "Согласие сброшено: перед следующим фото спрошу заново.",
+        parse_mode="HTML",
+    )
 
 
 @dp.message(Command("legal", "privacy", "consent"))
@@ -3570,7 +3783,7 @@ async def _dup_notice(msg: Message, seen: dict) -> None:
     tier = seen.get("tier") or ""
     try:
         await msg.reply(
-            f"📸 Это фото уже было в этом чате — его МОГ <b>{score:.4f}</b>"
+            f"📸 Это фото уже было в этом чате — его МОГ <b>{_fmt(score)}</b>"
             f"{(' · ' + tier) if tier else ''}.\n"
             "Повтор не пересчитываю: балл от него не меняется, карточка выше.",
             parse_mode="HTML",
@@ -3672,6 +3885,13 @@ async def _process_photo(msg: Message, bot: Bot, raw: bytes, user=None) -> None:
 
         await status.delete()
         mog_line = _mog_tag(raw, score, tier)
+        # 🔥 Стрик: причина вернуться завтра вместо «пересдача — завтра».
+        try:
+            streak = await mog_db.bump_streak(msg.from_user.id)
+        except Exception:  # noqa: BLE001 — стрик не должен ломать разбор
+            log.exception("streak failed")
+            streak = 0
+        mog_line += _streak_line(streak)
 
         # 💾 Сохраняем ролл в БД. Без этого арена и дуэли «не видят» фото:
         # get_best_roll() возвращает пустоту, и вход в игру ругается «сначала фото».

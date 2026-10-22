@@ -12,6 +12,7 @@ from __future__ import annotations
 import secrets
 
 from . import config
+from .textfmt import fmt
 from . import db
 
 
@@ -94,7 +95,7 @@ def invite_text(duel: dict, bot_username: str) -> tuple[str, str]:
     hours = config.DUEL_LINK_TTL_HOURS
     text = (
         f'⚔️ <b>{_mention(duel["challenger_id"], duel["challenger_name"])}</b> вызывает тебя на дуэль!\n\n'
-        f"Его МОГ: <b>{duel['challenger_score']:.4f}</b>\n\n"
+        f"Его МОГ: <b>{fmt(duel['challenger_score'])}</b>\n\n"
         "Жми ссылку — попадёшь в бота, примешь вызов и кинешь своё фото. "
         "Кто выше по МОГ — тот и победил.\n"
         "В конце оба получат карточку с табло: два балла, победитель, разрыв.\n\n"
@@ -107,7 +108,7 @@ def invite_text(duel: dict, bot_username: str) -> tuple[str, str]:
 def accepted_text(duel: dict) -> str:
     return (
         f'⚔️ Ты принял вызов от {_mention(duel["challenger_id"], duel["challenger_name"])}.\n'
-        f'Его МОГ: <b>{duel["challenger_score"]:.4f}</b>\n\n'
+        f'Его МОГ: <b>{fmt(duel["challenger_score"])}</b>\n\n'
         "📸 <b>Что кидать:</b> ответь <b>на это сообщение</b> своим фото — "
         "или просто пришли фото, я жду именно от тебя.\n"
         "🎁 <b>Что получишь:</b> карточку с твоим МОГ и табло боя на картинке — "
@@ -129,7 +130,7 @@ def result_text(r: dict) -> str:
     return (
         f"⚔️ <b>ДУЭЛЬ ЗАВЕРШЕНА</b>\n"
         f"┌───────── ⚔️ ─────────┐\n"
-        f"│  {cs:.4f}  │  {os_:.4f}  │\n"
+        f"│  {fmt(cs)}  │  {fmt(os_)}  │\n"
         f"└────────────────────────┘\n"
         f"{c} — вызывающий · {o} — принимавший\n\n"
         f"{verdict}\n\n"
@@ -143,7 +144,7 @@ def opponent_joined_text(duel: dict) -> str:
         f'⚔️ <b>{_mention(duel["opponent_id"], duel["opponent_name"])}</b> '
         "принял твой вызов и кидает фото 👀\n\n"
         "Тебе присылать ничего не нужно — твой балл "
-        f'<b>{duel["challenger_score"]:.4f}</b> уже в игре.\n'
+        f'<b>{fmt(duel["challenger_score"])}</b> уже в игре.\n'
         "Как придёт его фото — выдам табло обоим."
     )
 
@@ -152,7 +153,7 @@ def expired_text(duel: dict) -> str:
     """Уведомление ВЫЗЫВАЮЩЕМУ, что никто не пришёл."""
     return (
         f"⌛ <b>Соперник слился.</b>\n\n"
-        f'Вызов на {duel["challenger_score"]:.4f} провисел '
+        f'Вызов на {fmt(duel["challenger_score"])} провисел '
         f'{config.DUEL_LINK_TTL_HOURS} ч без ответа.\n'
         "Ссылка больше не работает. Хочешь ещё — создай новый вызов ⚔️"
     )

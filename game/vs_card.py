@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import io
+from game.textfmt import fmt
 import os
 
 W, H = 1080, 1350  # портретный постер: в ленте Telegram читается во всю ширину
@@ -213,10 +214,10 @@ def vs_card(
     _glow(layer, cx, cy - 40, "VS", _font(76), ACCENT, radius=14)
 
     d = ImageDraw.Draw(layer)
-    d.text((56, hero_bottom - 96), f"{score_a:.4f}", font=_font(64), fill=INK)
+    d.text((56, hero_bottom - 96), f"{fmt(score_a)}", font=_font(64), fill=INK)
     d.text(
         (W - 56, hero_bottom - 96),
-        f"{score_b:.4f}",
+        f"{fmt(score_b)}",
         font=_font(64),
         fill=MUTED if winner == "a" else INK,
         anchor="ra",
@@ -230,7 +231,7 @@ def vs_card(
     d.rectangle([0, hero_bottom, W, H], fill=TEAL_0 + (255,))
     d.line([(40, hero_bottom + 1), (W - 40, hero_bottom + 1)], fill=TEAL_2, width=2)
 
-    pill = f"{verdict.upper()}  ·  {gap:.4f}"
+    pill = f"{verdict.upper()}  ·  {fmt(gap)}"
     f_pill = _font(40)
     b = d.textbbox((0, 0), pill, font=f_pill)
     pw = b[2] - b[0] + 76
@@ -300,7 +301,7 @@ def champion_card(
     d.rectangle([0, hero_bottom, W, H], fill=TEAL_0 + (255,))
     d.line([(40, hero_bottom + 1), (W - 40, hero_bottom + 1)], fill=TEAL_2, width=2)
 
-    _text_center(d, W // 2, hero_bottom + 48, f"{score:.4f}", _font(84), INK)
+    _text_center(d, W // 2, hero_bottom + 48, f"{fmt(score)}", _font(84), INK)
     _text_center(d, W // 2, hero_bottom + 152, (tier or "").upper(), _font(32), ACCENT)
     if path:
         _text_center(d, W // 2, hero_bottom + 216, path, _font(30), MUTED)

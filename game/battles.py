@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from . import db
+from .textfmt import fmt
 
 
 async def create(chat_id: int, challenger: dict, opponent: dict) -> int:
@@ -152,14 +153,14 @@ def result_text(r: dict) -> str:
     margin = abs(cs - os_)
 
     if r["winner_id"] is None:
-        verdict = f"🤝 <b>НИЧЬЯ</b> — оба на {cs:.4f}. Скучно, но честно."
-        first, second = f"{c} — {cs:.4f}", f"{o} — {os_:.4f}"
+        verdict = f"🤝 <b>НИЧЬЯ</b> — оба на {fmt(cs)}. Скучно, но честно."
+        first, second = f"{c} — {fmt(cs)}", f"{o} — {fmt(os_)}"
     elif r["winner_id"] == r["challenger_id"]:
-        verdict = f"👑 <b>ПОБЕДА: {c}</b> · разрыв {margin:.4f}"
-        first, second = f"🥇 {c} — <b>{cs:.4f}</b>", f"🥈 {o} — {os_:.4f}"
+        verdict = f"👑 <b>ПОБЕДА: {c}</b> · разрыв {fmt(margin)}"
+        first, second = f"🥇 {c} — <b>{fmt(cs)}</b>", f"🥈 {o} — {fmt(os_)}"
     else:
-        verdict = f"👑 <b>ПОБЕДА: {o}</b> · разрыв {margin:.4f}"
-        first, second = f"🥇 {o} — <b>{os_:.4f}</b>", f"🥈 {c} — {cs:.4f}"
+        verdict = f"👑 <b>ПОБЕДА: {o}</b> · разрыв {fmt(margin)}"
+        first, second = f"🥇 {o} — <b>{fmt(os_)}</b>", f"🥈 {c} — {fmt(cs)}"
 
     boost_block = ""
     c_comp = r.get("challenger_comp") or {}

@@ -158,6 +158,21 @@ CREATE INDEX IF NOT EXISTS idx_seen_raw ON seen_photos(chat_id, raw_hash);
 CREATE INDEX IF NOT EXISTS idx_rolls_user_hash ON rolls(user_id, photo_hash);
 CREATE INDEX IF NOT EXISTS idx_battles_pending ON battles(chat_id, opponent_id, status);
 CREATE INDEX IF NOT EXISTS idx_arenas_chat ON arenas(chat_id, status);
+
+CREATE TABLE IF NOT EXISTS streaks (
+    user_id INTEGER PRIMARY KEY,
+    day     TEXT    NOT NULL DEFAULT '',
+    streak  INTEGER NOT NULL DEFAULT 0
+);
+
+-- Откуда пришёл человек: ?start=s_<src>. Без этого посевы не посчитать.
+CREATE TABLE IF NOT EXISTS starts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    src        TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_starts_src ON starts(src);
 """
 
 
@@ -439,6 +454,89 @@ async def get_history(user_id: int, limit: int = 10) -> list[dict]:
         "SELECT * FROM rolls WHERE user_id=? ORDER BY id DESC LIMIT ?", (user_id, limit)
     )
     return [_roll_row(r) for r in await cur.fetchall()]
+
+
+async def bump_streak(user_id: int) -> int:
+    """Стрик по дням: вчера было N → N+1, сегодня уже считали → N, иначе 1.
+
+    Зачем: «пересдача завтра» разрывала цикл — человек уходил и не возвращался.
+    Стрик, наоборот, даёт причину прийти завтра и не потерять серию.
+    """
+    assert _db is not None
+    today = _today()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    cur = await _db.execute("SELECT day, streak FROM streaks WHERE user_id=?", (user_id,))
+    row = await cur.fetchone()
+    if row is None:
+        streak = 1
+    elif row["day"] == today:
+        return int(row["streak"])
+    elif row["day"] == yesterday:
+        streak = int(row["streak"]) + 1
+    else:
+        streak = 1
+    await _db.execute(
+        "INSERT INTO streaks (user_id, day, streak) VALUES (?,?,?)"
+        " ON CONFLICT(user_id) DO UPDATE SET day=excluded.day, streak=excluded.streak",
+        (user_id, today, streak),
+    )
+    await _db.commit()
+    return streak
+
+
+async def get_streak(user_id: int) -> int:
+    assert _db is not None
+    cur = await _db.execute("SELECT streak FROM streaks WHERE user_id=?", (user_id,))
+    row = await cur.fetchone()
+    return int(row["streak"]) if row else 0
+
+
+async def last_roll(user_id: int) -> dict | None:
+    """Последний ролл юзера — из него собирается карточка для сторис."""
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT * FROM rolls WHERE user_id=? ORDER BY id DESC LIMIT 1", (user_id,)
+    )
+    row = await cur.fetchone()
+    return _roll_row(row) if row else None
+
+
+async def add_start(user_id: int, src: str) -> None:
+    """Записывает источник первого входа (?start=s_<src>). Дубли не страшны."""
+    assert _db is not None
+    await _db.execute(
+        "INSERT INTO starts (user_id, src, created_at) VALUES (?,?,?)",
+        (user_id, (src or "direct")[:32], _now()),
+    )
+    await _db.commit()
+
+
+async def start_counts(limit: int = 30) -> list[dict]:
+    """Сколько РАЗНЫХ людей пришло с каждого источника."""
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT src, COUNT(DISTINCT user_id) AS users, COUNT(*) AS starts"
+        " FROM starts GROUP BY src ORDER BY users DESC LIMIT ?",
+        (limit,),
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def forget_user(user_id: int) -> dict[str, int]:
+    """«Забудь меня»: стирает баллы, историю, согласие и стрик.
+
+    Фото и так не хранятся — удалять нечего, кроме производных записей.
+    """
+    assert _db is not None
+    out: dict[str, int] = {}
+    for table in ("rolls", "streaks", "consents", "credits", "starts"):
+        try:
+            cur = await _db.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+            out[table] = max(0, cur.rowcount)
+        except Exception:  # noqa: BLE001 — таблицы может не быть в старой базе
+            out[table] = 0
+    await _db.commit()
+    return out
 
 
 def _roll_row(row: aiosqlite.Row) -> dict:

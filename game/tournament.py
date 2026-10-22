@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from html import escape
+from .textfmt import fmt
 
 MIN_PHOTOS = 2
 MAX_PHOTOS = 8
@@ -227,8 +228,8 @@ def match_line(a: dict, b: dict | None, w: dict, *, rng=None) -> str:
     gap = abs(a["score"] - b["score"])
     loser = b if w is a else a
     lines = [
-        f'🥊 {_fighter(a)} <code>{a["score"]:.4f}</code> '
-        f'⚔ {_fighter(b)} <code>{b["score"]:.4f}</code>',
+        f'🥊 {_fighter(a)} <code>{fmt(a["score"])}</code> '
+        f'⚔ {_fighter(b)} <code>{fmt(b["score"])}</code>',
         f"   💬 {hype_line(a, b, rng)}",
         f"   ✅ победа: {_fighter(w)} · {_verdict(gap)}",
     ]
@@ -289,8 +290,8 @@ def match_post_text(a: dict, b: dict, w: dict, *, rng=None) -> str:
     loser = b if w is a else a
 
     para1 = (
-        f"<b>#{a['slot']}</b> {a['score']:.4f} против "
-        f"<b>#{b['slot']}</b> {b['score']:.4f} — разрыв {gap:.4f}. "
+        f"<b>#{a['slot']}</b> {fmt(a['score'])} против "
+        f"<b>#{b['slot']}</b> {fmt(b['score'])} — разрыв {fmt(gap)}. "
         f"{hype_line(a, b, rng)}"
     )
     ta, tb = _top_stats(a, 1), _top_stats(b, 1)
@@ -302,7 +303,7 @@ def match_post_text(a: dict, b: dict, w: dict, *, rng=None) -> str:
 
     core = (
         f"<b>#{w['slot']}</b> забирает бой — {verdict_label(gap)} "
-        f"с запасом {gap:.4f}."
+        f"с запасом {fmt(gap)}."
     )
     why = why_line(w, loser, rng, tight=gap <= FLAWLESS_GAP)
     if why:
@@ -317,7 +318,7 @@ def bye_post(a: dict, title: str) -> str:
     return (
         f"<b>{title}</b>\n\n"
         f"▫️ <b>#{a['slot']}</b> проходит дальше без боя: пары не нашлось. "
-        f"Балл у него всё равно {a['score']:.4f} — сетка просто подождала."
+        f"Балл у него всё равно {fmt(a['score'])} — сетка просто подождала."
     )
 
 
@@ -326,7 +327,7 @@ def result_header(rounds: list[list[tuple]], champion: dict, *, total: int) -> s
     return (
         f"⚔️ <b>СЕТКА СЫГРАНА</b> · {total} фото\n\n"
         f"🏆 Чемпион: <b>#{champion['slot']}</b> · "
-        f"{champion['score']:.4f} · {_esc(champion['tier'])}\n\n"
+        f"{fmt(champion['score'])} · {_esc(champion['tier'])}\n\n"
         "Ниже — по постеру на каждый бой и два абзаца: как прошло и почему так."
     )
 
@@ -419,7 +420,7 @@ def champion_text(
     rng = _rng("crown", champion.get("hash"), champion["score"])
     lines = [
         f"🏆 <b>CHAMPION</b> · {_fighter(champion)}",
-        f"<b>{champion['score']:.4f}</b> · {_esc(champion['tier'])}",
+        f"<b>{fmt(champion['score'])}</b> · {_esc(champion['tier'])}",
         "",
         f"💪 Чем берёт: {strong}",
     ]

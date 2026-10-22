@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from html import escape
 
 from . import db
+from .textfmt import fmt
 
 MIN_PLAYERS = 2
 MAX_PLAYERS = 8
@@ -161,12 +162,12 @@ def result_text(arena: dict, players: list[dict]) -> str:
     for i, p in enumerate(ranked):
         medal = _MEDALS[i] if i < len(_MEDALS) else "▫️"
         tag = f'<a href="tg://user?id={p["user_id"]}">{_esc(p["name"])}</a>'
-        lines.append(f'{medal} <b>{p["score"]:.4f}</b> · {p["tier"]} — {tag}')
+        lines.append(f'{medal} <b>{fmt(p["score"])}</b> · {p["tier"]} — {tag}')
     win = ranked[0]
     return (
         f"🏆 <b>МОГ-АРЕНА #{arena['id']}</b> · {len(ranked)} {_fighters(len(ranked))}\n\n"
         + "\n".join(lines)
-        + f'\n\n👑 <b>Корона: {_esc(win["name"])}</b> · {win["score"]:.4f}'
+        + f'\n\n👑 <b>Корона: {_esc(win["name"])}</b> · {fmt(win["score"])}'
         + "\n\n<i>MOG — игра. Баллы случайны, не оценка внешности.</i>"
     )
 
@@ -271,6 +272,6 @@ def bracket_text(arena: dict, players: list[dict]) -> str:
     ch = br.get("champion")
     if ch:
         out.append(
-            f"👑 <b>Чемпион: {_esc(ch['name'])}</b> · {ch['score']:.4f} ({ch['tier']})"
+            f"👑 <b>Чемпион: {_esc(ch['name'])}</b> · {fmt(ch['score'])} ({ch['tier']})"
         )
     return "\n".join(out)
