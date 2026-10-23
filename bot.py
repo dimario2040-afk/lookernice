@@ -33,7 +33,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-22h-implied"
+APP_VERSION = "2026-10-23a-mobile"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -840,7 +840,8 @@ async def cmd_start(msg: Message, bot: Bot) -> None:
 
     welcome = (
         "💀 <b>PSL-бот на связи.</b>\n\n"
-        "Кидай своё фото (лицо крупно, без очков и фильтров) — "
+        "Кидай своё фото — скрепкой 📎 → «Фото» (или файлом jpg; лицо крупно, "
+        "без очков и фильтров) — "
         "сначала скажу по-человечески, без занудства. "
         "А если хочешь жести — жми кнопку «📊 Подробный разбор»: "
         "там PSL-рейтинг, кости, failo/halo и план прокачки.\n\n"
@@ -902,8 +903,9 @@ def _photo_cta(*, addressed: bool = True) -> str:
     """
     if addressed:
         how = (
-            "ответь <b>на это сообщение</b> своим фото (кнопка «Ответить» → фото) "
-            "или просто кинь фото в чат — бой закроется сам"
+            "ответь <b>на это сообщение</b> своим фото: «Ответить» → скрепка → «Фото». "
+            "Можно и просто в чат, но если на обычное фото тишина — значит бот видит "
+            "только ответы, тогда отвечай на моё сообщение"
         )
     else:
         how = (
@@ -3494,6 +3496,14 @@ _ASK_ENTRIES_MAX = 400
 _ASK_COOLDOWN = 6 * 60 * 60
 _ask_pending: dict[str, tuple[float, bytes, int, int]] = {}
 _ask_last: dict[tuple[int, int], float] = {}
+# Кто уже нажал «👌 Оценить» в этом чате: 6 часов его фото идут без вопросов.
+_ask_ok: dict[tuple[int, int], float] = {}
+
+
+def _ask_ok_fresh(msg: Message) -> bool:
+    """Человек уже разрешил разбор в этом чате за последние 6 часов?"""
+    key = (msg.chat.id, msg.from_user.id)
+    return time.time() - _ask_ok.get(key, 0.0) < _ASK_COOLDOWN
 
 
 def _ask_keyboard(token: str) -> InlineKeyboardMarkup:
@@ -3568,6 +3578,11 @@ async def on_ask(cb: CallbackQuery, bot: Bot) -> None:
         except Exception:  # noqa: BLE001
             pass
         return
+    _ask_ok[(chat_id, user_id)] = time.time()
+    if len(_ask_ok) > 5000:
+        cutoff = time.time() - _ASK_COOLDOWN
+        for k in [k for k, ts in _ask_ok.items() if ts < cutoff]:
+            _ask_ok.pop(k, None)
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:  # noqa: BLE001
@@ -3576,44 +3591,33 @@ async def on_ask(cb: CallbackQuery, bot: Bot) -> None:
     await _process_photo(cb.message, bot, raw, user=cb.from_user)
 
 
-@dp.message(F.photo)
-async def on_photo(msg: Message, bot: Bot) -> None:
-    # 🏟 Режим тестового турнира: не разбираем, а копим фото в сетку.
-    st = _tt_get(msg.from_user.id)
-    if st and st.get("stage") == "collect" and msg.chat.type == "private":
-        await _tt_add_photo(msg, bot, msg.photo[-1].file_id)
-        return
-
-    if not TELEGRAM_TOKEN or not MODEL_API_KEY:
-        await msg.answer("⚠️ Бот не настроен: нет TELEGRAM_TOKEN или MODEL_API_KEY в .env")
-        return
-
-    # 🎯 В группе без адреса боту фото не трогаем вообще: ни скачивания, ни
-    # ответа. Иначе любая картинка в чате запускала разбор.
-    if not await _addressed_to_bot(msg, bot):
-        return
-
-    # 📸 Скачиваем фото ДО проверки согласия — чтобы после кнопки «Согласен»
-    # разбор стартовал сразу, без повторной отправки фото.
+async def _safe_process(
+    msg: Message, bot: Bot, raw: bytes, *, user=None
+) -> None:
+    """Разбор не должен падать в тишину: иначе «отправил фото и ничего»."""
     try:
-        photo = msg.photo[-1]  # самое большое разрешение
-        tg_file = await bot.get_file(photo.file_id)
-        photo_bytes = await bot.download_file(tg_file.file_path)
-        raw = photo_bytes.read()
-    except Exception:  # noqa: BLE001
-        log.exception("photo download failed")
-        await msg.answer("Не смог скачать фото. Отправь ещё раз 📸")
-        return
+        await _process_photo(msg, bot, raw, user=user)
+    except Exception:  # noqa: BLE001 — битый файл, HEIC, сбой модели
+        log.exception("photo handling failed (friendly)")
+        try:
+            await msg.answer(
+                "Не смог открыть эту картинку 🤷\n"
+                "Если это HEIC с iPhone — отправь как <b>фото</b> (скрепка → Фото), "
+                "а не файлом.",
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001 — чат закрыт/сообщение удалено
+            pass
 
-    # 🔞 Согласие подразумевается: шлагбаума нет, обработку не блокируем.
-    # Отметку пишем молча — она нужна как след, отзыв живёт в /forget.
-    await _ensure_consent(msg, bot)
 
+async def _on_image(msg: Message, bot: Bot, raw: bytes, *, addressed: bool) -> None:
+    """Единый вход для фото и картинки-файлом: и то и другое — просто фото."""
     # 🤔 В группе сначала спрашиваем: это вообще в МОГ? Рамка + один тап.
     # Спрашиваем ТОЛЬКО по фото с людьми: на скрин документа вопрос «оценить?»
     # сам по себе выглядит поломкой. Сначала дешёвый локальный фильтр, потом
     # крошечный вызов модели — так VLM не тратится на очевидные документы.
-    if await _ask_wanted(msg):
+    # Явный адрес боту (ответ/тег/вызов) — уже согласие, лишний вопрос не нужен.
+    if not addressed and not _ask_ok_fresh(msg) and await _ask_wanted(msg):
         # 🧾 Скрин документа отсекаем локально: ни вызова модели, ни вопроса.
         if await asyncio.to_thread(_looks_like_document, raw):
             await msg.reply(_NO_FACE_TEXT)
@@ -3631,7 +3635,43 @@ async def on_photo(msg: Message, bot: Bot) -> None:
         )
         return
 
-    await _process_photo(msg, bot, raw)
+    await _safe_process(msg, bot, raw)
+
+
+@dp.message(F.photo)
+async def on_photo(msg: Message, bot: Bot) -> None:
+    # 🏟 Режим тестового турнира: не разбираем, а копим фото в сетку.
+    st = _tt_get(msg.from_user.id)
+    if st and st.get("stage") == "collect" and msg.chat.type == "private":
+        await _tt_add_photo(msg, bot, msg.photo[-1].file_id)
+        return
+
+    if not TELEGRAM_TOKEN or not MODEL_API_KEY:
+        await msg.answer("⚠️ Бот не настроен: нет TELEGRAM_TOKEN или MODEL_API_KEY в .env")
+        return
+
+    # 🎯 В группе фото без адреса — не повод молчать: спрашиваем один раз
+    # («это в МОГ?»). Тишина читается как «бот сломан», особенно с телефона.
+    addressed = await _addressed_to_bot(msg, bot)
+    if not addressed and not _ask_ok_fresh(msg) and not await _ask_wanted(msg):
+        return
+
+    # 📸 Скачиваем фото до любых проверок: байты нужны и вопросу, и разбору.
+    try:
+        photo = msg.photo[-1]  # самое большое разрешение
+        tg_file = await bot.get_file(photo.file_id)
+        photo_bytes = await bot.download_file(tg_file.file_path)
+        raw = photo_bytes.read()
+    except Exception:  # noqa: BLE001
+        log.exception("photo download failed")
+        await msg.answer("Не смог скачать фото. Отправь ещё раз 📸")
+        return
+
+    # 🔞 Согласие подразумевается: шлагбаума нет, обработку не блокируем.
+    # Отметку пишем молча — она нужна как след, отзыв живёт в /forget.
+    await _ensure_consent(msg, bot)
+
+    await _on_image(msg, bot, raw, addressed=addressed)
 
 
 class _MsgAs:
@@ -3653,20 +3693,39 @@ class _MsgAs:
 
 @dp.message(F.document)
 async def on_document(msg: Message, bot: Bot) -> None:
-    """Файл картинкой (jpg/png «как файл») — только в режиме турнира."""
-    st = _tt_get(msg.from_user.id)
-    if not st or st.get("stage") != "collect" or msg.chat.type != "private":
-        await on_other(msg)
-        return
+    """Картинка файлом: в турнире — в сетку, в личке — обычный разбор."""
     doc = msg.document
     mime = (doc.mime_type or "").lower()
+    st = _tt_get(msg.from_user.id)
+    collecting = (
+        st is not None and st.get("stage") == "collect" and msg.chat.type == "private"
+    )
+    # В группе файлы не трогаем: там фото и так приходит как фото.
+    if msg.chat.type != "private":
+        await on_other(msg)
+        return
     if not mime.startswith("image/"):
         await msg.answer("Это не картинка. Кидай jpg/png — фото или файлом.")
         return
     if (doc.file_size or 0) > 10 * 1024 * 1024:
         await msg.answer("Файл больше 10 МБ — сожми и кидай ещё.")
         return
-    await _tt_add_photo(msg, bot, doc.file_id)
+    if collecting:
+        await _tt_add_photo(msg, bot, doc.file_id)
+        return
+    if not TELEGRAM_TOKEN or not MODEL_API_KEY:
+        await msg.answer("⚠️ Бот не настроен: нет TELEGRAM_TOKEN или MODEL_API_KEY в .env")
+        return
+    try:
+        tg_file = await bot.get_file(doc.file_id)
+        bio = await bot.download_file(tg_file.file_path)
+        raw = bio.read()
+    except Exception:  # noqa: BLE001
+        log.exception("document download failed")
+        await msg.answer("Не смог скачать файл. Отправь ещё раз 📸")
+        return
+    await _ensure_consent(msg, bot)
+    await _on_image(msg, bot, raw, addressed=True)
 
 
 async def _resolve_chat_battle(msg: Message, score: float) -> dict | None:
