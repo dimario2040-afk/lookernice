@@ -30,10 +30,10 @@ except ImportError:
     mp = None  # type: ignore[assignment]
     BIOMETRY_AVAILABLE = False
 import numpy as np
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-23b-alive"
+APP_VERSION = "2026-10-23c-diag"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -811,6 +811,21 @@ def _remember_photo(user_id: int, raw: bytes, metrics_text: str, metrics: dict) 
 
 # ---------------------------------------------------------------- бот
 dp = Dispatcher()
+# Сколько апдейтов реально дошло от Telegram и когда — видно в /healthz.
+# Нужно, чтобы отличать «бот сломан» от «Telegram молчит» без гаданий.
+_UPD_N = 0
+_UPD_LAST = 0.0
+
+
+class _UpdateCounter(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        global _UPD_N, _UPD_LAST
+        _UPD_N += 1
+        _UPD_LAST = time.time()
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(_UpdateCounter())
 BOT_ME_ID: int | None = None
 _BOT_USERNAME = ""
 # Хэш (chat_id, user_id) → ts: нажал «Я в деле» без ролла, ждём его фото в этом чате.
@@ -4129,7 +4144,16 @@ async def main() -> None:
                 pil = True
             except Exception:  # noqa: BLE001
                 pil = False
-            return web.json_response({"ok": True, "pil": pil, "ver": APP_VERSION})
+            return web.json_response(
+                {
+                    "ok": True,
+                    "pil": pil,
+                    "ver": APP_VERSION,
+                    "boot": int(time.time() - _START_TS),
+                    "upd": _UPD_N,
+                    "last_upd": int(time.time() - _UPD_LAST) if _UPD_LAST else -1,
+                }
+            )
 
         app.router.add_get("/", health)  # для Render health-check и cron-job.org анти-сна
         app.router.add_get("/healthz", health)
