@@ -33,7 +33,7 @@ import numpy as np
 from aiogram import Bot, Dispatcher, F
 
 # Бейдж сборки: виден в /healthz, чтобы проверять прод без догадок.
-APP_VERSION = "2026-10-23a-mobile"
+APP_VERSION = "2026-10-23b-alive"
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -871,6 +871,33 @@ def _start_source(payload: str) -> str:
             raw = raw[len(prefix):]
             break
     return re.sub(r"[^A-Za-z0-9_-]", "", raw)[:32]
+
+
+# Момент старта процесса: /ping показывает аптайм, по нему видно, спал ли бот.
+_START_TS = time.time()
+
+
+@dp.message(Command("ping", "пинг"))
+async def cmd_ping(msg: Message, bot: Bot) -> None:
+    """«Ты живой?» — отвечает без БД и без нейронки."""
+    keys = sum(
+        1
+        for k in (
+            "MODEL_API_KEY",
+            "GEMINI_API_KEY",
+            "GROQ_API_KEY",
+            "AIHUBMIX_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "OPENROUTER_API_KEY",
+        )
+        if os.environ.get(k)
+    )
+    await msg.answer(
+        f"🏓 pong · <code>{APP_VERSION}</code>\n"
+        f"⏱ аптайм {int(time.time() - _START_TS)} c · VLM-ключей: {keys}\n"
+        f"🧠 биометрия: {'да' if BIOMETRY_AVAILABLE else 'нет (только нейронка)'}",
+        parse_mode="HTML",
+    )
 
 
 @dp.message(Command("help"))
@@ -3498,6 +3525,11 @@ _ask_pending: dict[str, tuple[float, bytes, int, int]] = {}
 _ask_last: dict[tuple[int, int], float] = {}
 # Кто уже нажал «👌 Оценить» в этом чате: 6 часов его фото идут без вопросов.
 _ask_ok: dict[tuple[int, int], float] = {}
+# id последнего «Оценить это фото?» на пару чат+человек: держим в чате ОДИН
+# вопрос вместо тишины или спама — старый удаляем, новый пишем.
+_ask_msg: dict[tuple[int, int], int] = {}
+# Переспрашивать не чаще раза в минуту: фото-дамп не превращается в спам.
+_ASK_GAP = 60.0
 
 
 def _ask_ok_fresh(msg: Message) -> bool:
@@ -3536,7 +3568,9 @@ async def _ask_wanted(msg: Message) -> bool:
     if msg.chat.type not in ("group", "supergroup"):
         return False
     key = (msg.chat.id, msg.from_user.id)
-    if time.time() - _ask_last.get(key, 0.0) < _ASK_COOLDOWN:
+    # Раньше тут был 6-часовой кулдаун: человек кидал фото — и упирался в
+    # тишину. Теперь не чаще раза в минуту, а сам вопрос в чате всегда один.
+    if time.time() - _ask_last.get(key, 0.0) < _ASK_GAP:
         return False
     from game import db as mog_db
 
@@ -3625,14 +3659,24 @@ async def _on_image(msg: Message, bot: Bot, raw: bytes, *, addressed: bool) -> N
         if await asyncio.to_thread(_face_verdict, raw) is False:
             await msg.reply(_NO_FACE_TEXT)
             return
-        _ask_last[(msg.chat.id, msg.from_user.id)] = time.time()
+        key = (msg.chat.id, msg.from_user.id)
+        old_q = _ask_msg.pop(key, None)
+        if old_q:
+            try:
+                await bot.delete_message(msg.chat.id, old_q)
+            except Exception:  # noqa: BLE001 — уже удалён/старый
+                pass
+        _ask_last[key] = time.time()
         token = _ask_store(raw, msg.chat.id, msg.from_user.id)
-        await msg.reply(
+        question = await msg.reply(
             "🎰 <b>МОГ</b> · 18+ · не соревнуемся, просто ржём.\n"
             "Оценить это фото?",
             reply_markup=_ask_keyboard(token),
             parse_mode="HTML",
         )
+        mid = getattr(question, "message_id", None)
+        if mid:
+            _ask_msg[key] = mid
         return
 
     await _safe_process(msg, bot, raw)
@@ -4116,8 +4160,11 @@ async def main() -> None:
 
         # Telegram-настройка уже после бинда порта.
         try:
+            # drop_pending_updates НЕ ставим: инстанс засыпает, сообщение его
+            # будит — и раньше тут же вычищалось вместе с очередью. Теперь оно
+            # доходит, пусть и с задержкой на пробуждение.
             await bot.set_webhook(
-                f"{PUBLIC_BASE_URL}{hook_path}", secret_token=secret, drop_pending_updates=True
+                f"{PUBLIC_BASE_URL}{hook_path}", secret_token=secret, drop_pending_updates=False
             )
             log.info("webhook установлен: %s%s", PUBLIC_BASE_URL, hook_path)
         except Exception:  # noqa: BLE001

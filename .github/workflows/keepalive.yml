@@ -14,7 +14,7 @@ name: keepalive
 on:
   schedule:
     # каждые 14 минут (Render засыпает на 15-й) — безопасно ниже порога
-    - cron: "*/14 * * * *"
+    - cron: "*/10 * * * *"
   push:
     branches: [main]
   workflow_dispatch:
